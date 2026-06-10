@@ -2,28 +2,27 @@ import sys
 import os
 import numpy as np
 from PIL import Image
-from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QPushButton, QFileDialog, QProgressBar, 
-                             QCheckBox, QMessageBox, QGridLayout)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
-from PyQt5.QtGui import QPixmap, QDesktopServices
+from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, 
+                             QPushButton, QFileDialog, QProgressBar, 
+                             QCheckBox, QMessageBox, QGridLayout, QStyleOption, QStyle)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QRect, QRectF, QEvent
+from PyQt5.QtGui import (QPixmap, QDesktopServices, QPainter, QPainterPath, 
+                         QColor, QFont, QRadialGradient, QBrush)
 
 # --- STYLESHEET ---
 dark_theme_qss = """
-QWidget {
+QWidget#MainWindow {
     background-color: #1e1e1e;
     color: #e0e0e0;
     font-family: "Segoe UI", Arial, sans-serif;
     font-size: 14px;
 }
-QLabel[previewZone="true"] {
+QWidget[previewZone="true"] {
     background-color: #252526;
     border: 2px dashed #3e3e42;
     border-radius: 8px;
-    padding: 10px;
-    qproperty-alignment: AlignCenter;
 }
-QLabel[previewZone="true"]:hover {
+QWidget[previewZone="true"]:hover {
     background-color: #2d2d30;
     border: 2px dashed #007acc;
 }
@@ -46,6 +45,7 @@ QProgressBar {
     color: white;
 }
 QProgressBar::chunk { background-color: #007acc; border-radius: 5px; }
+QCheckBox { color: #e0e0e0; }
 QCheckBox::indicator {
     width: 18px; height: 18px;
     border-radius: 4px;
@@ -55,15 +55,18 @@ QCheckBox::indicator {
 QCheckBox::indicator:checked { background-color: #007acc; border: 2px solid #007acc; }
 """
 
-# --- DRAG AND DROP LABEL ---
-class ImagePreviewLabel(QLabel):
+# --- DRAG AND DROP WIDGET ---
+class ImagePreviewWidget(QWidget):
     file_loaded = pyqtSignal(str)
 
     def __init__(self, text):
-        super().__init__(text)
+        super().__init__()
         self.setProperty("previewZone", "true")
         self.setAcceptDrops(True)
         self.filepath = None
+        self.text_label = text
+        self.pixmap = None
+        self.setMinimumSize(140, 140)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -85,9 +88,47 @@ class ImagePreviewLabel(QLabel):
 
     def load_image(self, filepath):
         self.filepath = filepath
-        pixmap = QPixmap(filepath).scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.setPixmap(pixmap)
+        self.pixmap = QPixmap(filepath)
         self.file_loaded.emit(filepath)
+        self.update()
+
+    def paintEvent(self, event):
+        opt = QStyleOption()
+        opt.initFrom(self)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        
+        # Draw QSS background & borders
+        self.style().drawPrimitive(QStyle.PE_Widget, opt, p, self)
+
+        # Draw filled image
+        if self.pixmap and not self.pixmap.isNull():
+            scaled_pix = self.pixmap.scaled(self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            x = (self.width() - scaled_pix.width()) // 2
+            y = (self.height() - scaled_pix.height()) // 2
+            
+            # Clip to border radius so the image doesn't overflow the corners
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(2, 2, self.width()-4, self.height()-4), 6, 6)
+            p.setClipPath(path)
+            p.drawPixmap(x, y, scaled_pix)
+            p.setClipping(False)
+
+        # Draw text at the bottom inside
+        font = p.font()
+        font.setBold(True)
+        p.setFont(font)
+        
+        text_rect = QRect(0, self.height() - 30, self.width(), 25)
+        
+        # Shadow for readability
+        p.setPen(QColor(0, 0, 0, 200))
+        p.drawText(text_rect.translated(1, 1), Qt.AlignCenter, self.text_label)
+        p.drawText(text_rect.translated(-1, -1), Qt.AlignCenter, self.text_label)
+        
+        # Actual text
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(text_rect, Qt.AlignCenter, self.text_label)
 
 
 # --- PROCESSING THREAD ---
@@ -104,8 +145,6 @@ class ProcessThread(QThread):
     def run(self):
         try:
             self.progress.emit(10)
-            
-            # Determine target size based on first loaded texture
             target_size = None
             for p in self.paths.values():
                 if p:
@@ -118,13 +157,12 @@ class ProcessThread(QThread):
 
             self.progress.emit(20)
 
-            # Helper to load, resize, and convert to numpy array (float 0-1)
             def load_channel(path, default_val, channels=1):
                 if path and os.path.exists(path):
                     img = Image.open(path).convert('RGBA').resize(target_size, Image.Resampling.LANCZOS)
                     arr = np.array(img, dtype=np.float32) / 255.0
                     if channels == 1:
-                        return arr[:, :, 0] # Return Red channel for grayscale
+                        return arr[:, :, 0]
                     return arr[:, :, :channels]
                 else:
                     shape = (target_size[1], target_size[0]) if channels == 1 else (target_size[1], target_size[0], channels)
@@ -132,7 +170,6 @@ class ProcessThread(QThread):
 
             self.progress.emit(30)
             
-            # Load arrays
             base_color = load_channel(self.paths['basecolor'], 1.0, channels=3)
             ao = load_channel(self.paths['ao'], 1.0, channels=1)
             transparency = load_channel(self.paths['transparency'], 1.0, channels=1)
@@ -145,7 +182,6 @@ class ProcessThread(QThread):
 
             self.progress.emit(70)
 
-            # 1. BaseAOTransparency (RGB = BaseColor * AO, A = Transparency)
             out_color = np.zeros((target_size[1], target_size[0], 4), dtype=np.float32)
             out_color[:, :, :3] = base_color * ao[..., np.newaxis]
             out_color[:, :, 3] = transparency
@@ -156,12 +192,11 @@ class ProcessThread(QThread):
 
             self.progress.emit(85)
 
-            # 2. NMS (R=Normal.x, G=Normal.y, B=Metallic, A=Smoothness)
             out_nms = np.zeros((target_size[1], target_size[0], 4), dtype=np.float32)
-            out_nms[:, :, 0] = normal[:, :, 0] # Normal X
-            out_nms[:, :, 1] = normal[:, :, 1] # Normal Y
-            out_nms[:, :, 2] = metallic        # Metallic
-            out_nms[:, :, 3] = smoothness      # Smoothness
+            out_nms[:, :, 0] = normal[:, :, 0] 
+            out_nms[:, :, 1] = normal[:, :, 1] 
+            out_nms[:, :, 2] = metallic        
+            out_nms[:, :, 3] = smoothness      
 
             img_nms = Image.fromarray((np.clip(out_nms, 0, 1) * 255).astype(np.uint8), 'RGBA')
             nms_path = os.path.join(self.output_dir, "NMS.png")
@@ -178,31 +213,36 @@ class ProcessThread(QThread):
 class TexturePackerApp(QWidget):
     def __init__(self):
         super().__init__()
+        self.setObjectName("MainWindow")
         self.setWindowTitle("PBR Texture Packer Pro")
-        self.resize(600, 500)
+        self.resize(650, 550)
         self.setStyleSheet(dark_theme_qss)
         self.labels = {}
+        self.mouse_pos = None
         self.initUI()
+        
+        # Track mouse globally for the sparkle effect
+        QApplication.instance().installEventFilter(self)
 
     def initUI(self):
         layout = QVBoxLayout()
+        layout.setSpacing(15)
 
         grid = QGridLayout()
+        grid.setSpacing(15)
         slots = ['BaseColor', 'AO', 'Transparency', 'Normal', 'Metallic', 'Smoothness']
         
         for i, name in enumerate(slots):
-            lbl = ImagePreviewLabel(f"Click or Drop\n{name}")
+            lbl = ImagePreviewWidget(name)
             self.labels[name.lower()] = lbl
             grid.addWidget(lbl, i // 3, i % 3)
             
         layout.addLayout(grid)
 
-        # Options
         self.auto_open_cb = QCheckBox("Open output folder when done")
         self.auto_open_cb.setChecked(True)
         layout.addWidget(self.auto_open_cb)
 
-        # Progress and Button
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.progress_bar.hide()
@@ -213,6 +253,31 @@ class TexturePackerApp(QWidget):
         layout.addWidget(self.btn_pack)
 
         self.setLayout(layout)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseMove:
+            self.mouse_pos = self.mapFromGlobal(event.globalPos())
+            self.update()
+        return super().eventFilter(obj, event)
+
+    def paintEvent(self, event):
+        # Draw background via QSS
+        opt = QStyleOption()
+        opt.initFrom(self)
+        p = QPainter(self)
+        self.style().drawPrimitive(QStyle.PE_Widget, opt, p, self)
+
+        # Draw Sparkle Highlight
+        if self.mouse_pos:
+            p.setRenderHint(QPainter.Antialiasing)
+            radius = 60
+            grad = QRadialGradient(self.mouse_pos, radius)
+            grad.setColorAt(0, QColor(0, 122, 204, 80))  # Soft blue/white center
+            grad.setColorAt(1, QColor(0, 122, 204, 0))   # Transparent edge
+            
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(grad))
+            p.drawEllipse(self.mouse_pos, radius, radius)
 
     def process_textures(self):
         paths = {name: lbl.filepath for name, lbl in self.labels.items()}
