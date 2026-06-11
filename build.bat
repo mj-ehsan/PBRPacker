@@ -1,1 +1,9 @@
-pyinstaller --noconfirm --onefile --windowed --icon=app_icon.ico PBRPacker.py
+@echo off
+setlocal
+
+pyinstaller ^
+  --noconfirm ^
+  --clean ^
+  PBRPacker.spec
+
+endlocal
