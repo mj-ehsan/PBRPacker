@@ -228,7 +228,7 @@ class PBRRendererWidget(QOpenGLWidget):
         alpha = resize_texture(alpha, max_w, max_h)
         normal = self.apply_normal_y_inversion(normal)
 
-        ao_channel = np.clip((ao[..., 0] / 255.0) * self.ao_intensity, 0.0, 1.0)
+        ao_channel = np.clip((ao[..., 0] / 255.0) ** max(self.ao_intensity, 0.00001), 0.0, 1.0)
         base_ao_rgb = base_color[..., :3] * ao_channel[..., np.newaxis]
         transparency = alpha[..., 0] if self.input_textures["Alpha"] is not None else base_color[..., 3]
 

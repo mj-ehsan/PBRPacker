@@ -30,7 +30,7 @@ def build_packed_arrays(paths, ao_intensity=1.0, invert_normal_y=False):
 
     base_color = get_array("BaseColor", (255, 255, 255, 255))
     ao = get_array("AO", (255, 255, 255, 255))[..., 0]
-    ao_channel = np.clip((ao / 255.0) * ao_intensity, 0.0, 1.0)
+    ao_channel = np.clip((ao / 255.0) ** max(ao_intensity, 0.00001), 0.0, 1.0)
     base_ao_rgb = base_color[..., :3] * ao_channel[..., np.newaxis]
 
     alpha_arr = get_array("Alpha", (255, 255, 255, 255))
