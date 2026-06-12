@@ -1,7 +1,7 @@
-#version 130
-varying vec3 v_normal;
-varying vec3 v_world_pos;
-varying vec2 v_uv;
+#version 330
+out vec3 v_normal;
+out vec3 v_world_pos;
+out vec2 v_uv;
 
 void main() {
     vec4 world_pos = gl_ModelViewMatrix * gl_Vertex;   // model matrix * vertex

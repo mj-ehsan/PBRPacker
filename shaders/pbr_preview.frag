@@ -1,4 +1,4 @@
-#version 130
+#version 330
 #extension GL_ARB_derivative_control : require
 
 #define saturate(a) (clamp(a, 0.0, 1.0))
@@ -17,9 +17,11 @@ uniform vec3 rim_light_color;
 uniform float rim_light_intensity;
 uniform vec3 camera_pos;
 
-varying vec3 v_normal;
-varying vec3 v_world_pos;
-varying vec2 v_uv;
+in vec3 v_normal;
+in vec3 v_world_pos;
+in vec2 v_uv;
+
+out vec4 FragColor
 
 struct Material {
     vec3 normal;
@@ -198,5 +200,5 @@ void main() {
     color *= pow(2.0, exposure);
     color = ACESFilm(color);
     
-    gl_FragColor = vec4(saturate(color), 1.0);
+    FragColor = vec4(saturate(color), 1.0);
 }
