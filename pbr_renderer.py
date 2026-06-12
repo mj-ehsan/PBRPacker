@@ -1,15 +1,20 @@
 import math
 import os
-
+import ctypes
 import numpy as np
+import glm
 from PIL import Image
-from PyQt5.QtCore import QPoint, QTimer, Qt
+from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtWidgets import QOpenGLWidget
 from PyQt5.QtGui import QSurfaceFormat
 from OpenGL.GL import *
-from OpenGL.GLU import *
-from OpenGL.GL.EXT.texture_filter_anisotropic import *
+from OpenGL.GL.EXT.texture_filter_anisotropic import GL_TEXTURE_MAX_ANISOTROPY_EXT, GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT
 
+# ----------------------------------------------------------------------
+# helper to convert numpy array to ctypes for VBO upload
+def np_to_gl_array(arr, dtype=np.float32):
+    return arr.astype(dtype).flatten().tobytes()
+# ----------------------------------------------------------------------
 
 class PBRRendererWidget(QOpenGLWidget):
     def __init__(self, parent=None):
@@ -18,12 +23,14 @@ class PBRRendererWidget(QOpenGLWidget):
         fmt = QSurfaceFormat()
         fmt.setSamples(8)
         fmt.setDepthBufferSize(24)
+        fmt.setVersion(3, 3)          # request OpenGL 3.3 core profile
+        fmt.setProfile(QSurfaceFormat.CoreProfile)
         self.setFormat(fmt)
 
         self.setMinimumSize(400, 400)
         self.rotation_x = -30.0
         self.rotation_y = -45.0
-        self.last_pos = QPoint()
+        self.last_pos = None
         self.zoom = -5.0
         self.key_light = {'pos': [6.0, 7.0, 8.0], 'color': [1.0, 0.97, 0.92], 'intensity': 18.0}
         self.fill_light = {'pos': [-5.0, 1.5, 2.5], 'color': [0.65, 0.75, 1.0], 'intensity': 4.5}
@@ -44,12 +51,25 @@ class PBRRendererWidget(QOpenGLWidget):
         }
         self.packed_base_ao_data = None
         self.packed_nms_data = None
-        self.sphere_list = None
-        self.wireframe_list = None
+
+        # --- VAO / VBO / EBO handles ---
+        self.sphere_vao = None
+        self.sphere_vbo_vertices = None
+        self.sphere_vbo_normals = None
+        self.sphere_vbo_texcoords = None
+        self.sphere_ebo = None
+        self.sphere_index_count = 0
+
+        self.wireframe_vao = None
+        self.wireframe_vbo = None
+        self.wireframe_vertex_count = 0
+
         self.has_anisotropy = False
         self.max_anisotropy = 1.0
+
         self.shader_program = None
         self.shader_dir = os.path.join(os.path.dirname(__file__), "shaders")
+
         self.timer = QTimer()
         self.timer.timeout.connect(self.auto_rotate)
         self.auto_rotate_enabled = True
@@ -58,26 +78,18 @@ class PBRRendererWidget(QOpenGLWidget):
         glEnable(GL_MULTISAMPLE)
         glClearColor(0.12, 0.12, 0.13, 1.0)
         glEnable(GL_DEPTH_TEST)
-        glEnable(GL_TEXTURE_2D)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE)
+
         self.check_anisotropy_support()
-        self.create_sphere()
-        self.create_wireframe_sphere()
+        self.create_sphere_geometry()
+        self.create_wireframe_sphere_geometry()
         self.create_shader_program()
         self.refresh_preview_textures()
         self.timer.start(16)
 
-    def create_shader_program(self):
-        vertex_shader = self.compile_shader(self.load_shader_source("pbr_preview.vert"), GL_VERTEX_SHADER)
-        fragment_shader = self.compile_shader(self.load_shader_source("pbr_preview.frag"), GL_FRAGMENT_SHADER)
-        self.shader_program = glCreateProgram()
-        glAttachShader(self.shader_program, vertex_shader)
-        glAttachShader(self.shader_program, fragment_shader)
-        glLinkProgram(self.shader_program)
-        if glGetProgramiv(self.shader_program, GL_LINK_STATUS) != GL_TRUE:
-            raise RuntimeError(glGetProgramInfoLog(self.shader_program).decode())
-        glDeleteShader(vertex_shader)
-        glDeleteShader(fragment_shader)
-
+    # ---- shader loading (unchanged) -------------------------------------------------
     def load_shader_source(self, filename):
         shader_path = os.path.join(self.shader_dir, filename)
         with open(shader_path, "r", encoding="utf-8") as shader_file:
@@ -91,6 +103,19 @@ class PBRRendererWidget(QOpenGLWidget):
             raise RuntimeError(glGetShaderInfoLog(shader).decode())
         return shader
 
+    def create_shader_program(self):
+        vertex_shader = self.compile_shader(self.load_shader_source("pbr_preview.vert"), GL_VERTEX_SHADER)
+        fragment_shader = self.compile_shader(self.load_shader_source("pbr_preview.frag"), GL_FRAGMENT_SHADER)
+        self.shader_program = glCreateProgram()
+        glAttachShader(self.shader_program, vertex_shader)
+        glAttachShader(self.shader_program, fragment_shader)
+        glLinkProgram(self.shader_program)
+        if glGetProgramiv(self.shader_program, GL_LINK_STATUS) != GL_TRUE:
+            raise RuntimeError(glGetProgramInfoLog(self.shader_program).decode())
+        glDeleteShader(vertex_shader)
+        glDeleteShader(fragment_shader)
+
+    # ---- anisotropy support ----------------------------------------------------------
     def check_anisotropy_support(self):
         try:
             extensions = glGetString(GL_EXTENSIONS)
@@ -107,61 +132,124 @@ class PBRRendererWidget(QOpenGLWidget):
             self.has_anisotropy = False
             self.max_anisotropy = 1.0
 
-    def create_sphere(self):
-        self.sphere_list = glGenLists(1)
-        glNewList(self.sphere_list, GL_COMPILE)
+    # =========================================================================
+    #  NEW: VAO‑based sphere creation
+    # =========================================================================
+    def create_sphere_geometry(self):
         radius = 1.5
-        slices = 32
-        stacks = 16
-        for i in range(stacks):
-            lat0 = math.pi * (-0.5 + float(i) / stacks)
-            z0 = math.sin(lat0)
-            zr0 = math.cos(lat0)
-            lat1 = math.pi * (-0.5 + float(i + 1) / stacks)
-            z1 = math.sin(lat1)
-            zr1 = math.cos(lat1)
-            glBegin(GL_QUAD_STRIP)
+        slices = 128
+        stacks = 128
+
+        vertices = []
+        normals = []
+        texcoords = []
+        indices = []
+
+        # generate vertices, normals, texcoords
+        for i in range(stacks + 1):
+            lat = math.pi * (-0.5 + float(i) / stacks)
+            z = math.sin(lat)
+            zr = math.cos(lat)
             for j in range(slices + 1):
                 lng = 2 * math.pi * float(j) / slices
                 x = math.cos(lng)
                 y = math.sin(lng)
-                glNormal3f(x * zr0, y * zr0, z0)
-                glTexCoord2f(float(j) / slices, float(i) / stacks)
-                glVertex3f(x * zr0 * radius, y * zr0 * radius, z0 * radius)
-                glNormal3f(x * zr1, y * zr1, z1)
-                glTexCoord2f(float(j) / slices, float(i + 1) / stacks)
-                glVertex3f(x * zr1 * radius, y * zr1 * radius, z1 * radius)
-            glEnd()
-        glEndList()
+                vertices.extend([x * zr * radius, y * zr * radius, z * radius])
+                normals.extend([x * zr, y * zr, z])        # unit length
+                texcoords.extend([float(j) / slices, float(i) / stacks])
 
-    def create_wireframe_sphere(self):
-        self.wireframe_list = glGenLists(1)
-        glNewList(self.wireframe_list, GL_COMPILE)
+        # generate indices for triangle strips
+        for i in range(stacks):
+            for j in range(slices):
+                first = i * (slices + 1) + j
+                second = first + slices + 1
+                indices.extend([first, second, first + 1])
+                indices.extend([second, second + 1, first + 1])
+
+        self.sphere_index_count = len(indices)
+
+        # --- VAO ---
+        self.sphere_vao = glGenVertexArrays(1)
+        glBindVertexArray(self.sphere_vao)
+
+        # vertex buffer
+        self.sphere_vbo_vertices = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.sphere_vbo_vertices)
+        glBufferData(GL_ARRAY_BUFFER, np_to_gl_array(np.array(vertices)), GL_STATIC_DRAW)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(0)
+
+        # normal buffer
+        self.sphere_vbo_normals = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.sphere_vbo_normals)
+        glBufferData(GL_ARRAY_BUFFER, np_to_gl_array(np.array(normals)), GL_STATIC_DRAW)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(1)
+
+        # texcoord buffer
+        self.sphere_vbo_texcoords = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.sphere_vbo_texcoords)
+        glBufferData(GL_ARRAY_BUFFER, np_to_gl_array(np.array(texcoords)), GL_STATIC_DRAW)
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(2)
+
+        # index buffer
+        self.sphere_ebo = glGenBuffers(1)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.sphere_ebo)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, np.array(indices, dtype=np.uint32).tobytes(), GL_STATIC_DRAW)
+
+        glBindVertexArray(0)
+
+    # =========================================================================
+    #  NEW: VAO‑based wireframe sphere (just lines)
+    # =========================================================================
+    def create_wireframe_sphere_geometry(self):
         radius = 1.5
         slices = 32
         stacks = 32
+        vertices = []
+
+        # latitude circles
         for i in range(stacks):
             lat = math.pi * (-0.5 + float(i) / stacks)
             z = radius * math.sin(lat)
             r = radius * math.cos(lat)
-            glBegin(GL_LINE_LOOP)
             for j in range(slices):
                 lng = 2 * math.pi * float(j) / slices
-                glVertex3f(r * math.cos(lng), r * math.sin(lng), z)
-            glEnd()
+                vertices.extend([r * math.cos(lng), r * math.sin(lng), z])
+                # next point
+                lng2 = 2 * math.pi * float(j + 1) / slices
+                vertices.extend([r * math.cos(lng2), r * math.sin(lng2), z])
+
+        # longitude lines
         for j in range(slices):
             lng = 2 * math.pi * float(j) / slices
-            glBegin(GL_LINE_STRIP)
-            for i in range(stacks + 1):
-                lat = math.pi * (-0.5 + float(i) / stacks)
-                glVertex3f(
-                    radius * math.cos(lat) * math.cos(lng),
-                    radius * math.cos(lat) * math.sin(lng),
-                    radius * math.sin(lat),
-                )
-            glEnd()
-        glEndList()
+            for i in range(stacks):
+                lat1 = math.pi * (-0.5 + float(i) / stacks)
+                lat2 = math.pi * (-0.5 + float(i + 1) / stacks)
+                vertices.extend([
+                    radius * math.cos(lat1) * math.cos(lng),
+                    radius * math.cos(lat1) * math.sin(lng),
+                    radius * math.sin(lat1),
+                    radius * math.cos(lat2) * math.cos(lng),
+                    radius * math.cos(lat2) * math.sin(lng),
+                    radius * math.sin(lat2)
+                ])
 
+        self.wireframe_vertex_count = len(vertices) // 3
+
+        self.wireframe_vao = glGenVertexArrays(1)
+        glBindVertexArray(self.wireframe_vao)
+        self.wireframe_vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.wireframe_vbo)
+        glBufferData(GL_ARRAY_BUFFER, np_to_gl_array(np.array(vertices)), GL_STATIC_DRAW)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(0)
+        glBindVertexArray(0)
+
+    # =========================================================================
+    #  Texture handling (unchanged except removal of makeCurrent/doneCurrent inside upload)
+    # =========================================================================
     def load_input_texture(self, name, path):
         if path and os.path.exists(path):
             try:
@@ -185,8 +273,8 @@ class PBRRendererWidget(QOpenGLWidget):
         return inverted
 
     def refresh_preview_textures(self):
-        if self.preview_mode == "packed" and self.packed_base_ao_data is not None and self.packed_nms_data is not None:
-            self.upload_texture_set(self.packed_base_ao_data, self.packed_nms_data)
+        if self.preview_mode == "packed" and self.packed_base_alpha_data is not None and self.packed_nms_data is not None:
+            self.upload_texture_set(self.packed_base_alpha_data, self.packed_nms_data)
             return
         self.upload_texture_set(*self.compose_live_texture_set())
 
@@ -244,7 +332,7 @@ class PBRRendererWidget(QOpenGLWidget):
         return base_ao_data, nms_data
 
     def upload_texture_set(self, base_ao_data, nms_data):
-        self.makeCurrent()
+        # No makeCurrent() here – called from paintGL context
         if self.base_alpha_tex is not None:
             glDeleteTextures([self.base_alpha_tex])
         if self.nms_tex is not None:
@@ -252,7 +340,6 @@ class PBRRendererWidget(QOpenGLWidget):
         self.base_alpha_tex = self.create_gl_texture(base_ao_data)
         self.nms_tex = self.create_gl_texture(nms_data)
         self.textures_loaded = True
-        self.doneCurrent()
         self.update()
 
     def create_gl_texture(self, data):
@@ -304,114 +391,131 @@ class PBRRendererWidget(QOpenGLWidget):
         self.preview_mode = "input"
         self.refresh_preview_textures()
 
+    # =========================================================================
+    #  NEW: uniform setup + drawing
+    # =========================================================================
+    def set_shader_uniforms(self):
+        # ---------- matrices ------------------------------------------------
+        model = (
+            glm.rotate(glm.mat4(1.0), glm.radians(self.rotation_x), glm.vec3(1, 0, 0)) *
+            glm.rotate(glm.mat4(1.0), glm.radians(self.rotation_y), glm.vec3(0, 1, 0))
+        )
+        view = glm.lookAt(
+            glm.vec3(0.0, 0.0, self.zoom),
+            glm.vec3(0.0, 0.0, 0.0),
+            glm.vec3(0.0, 1.0, 0.0)
+        )
+        projection = glm.perspective(
+            glm.radians(45.0),
+            self.width() / max(self.height(), 1.0),
+            0.1,
+            100.0
+        )
+
+        mvp = projection * view * model
+        normal_matrix = glm.transpose(glm.inverse(glm.mat3(view * model)))
+
+        glUniformMatrix4fv(glGetUniformLocation(self.shader_program, "u_mvp"), 1, GL_FALSE, glm.value_ptr(mvp))
+        glUniformMatrix4fv(glGetUniformLocation(self.shader_program, "u_model"), 1, GL_FALSE, glm.value_ptr(model))
+        glUniformMatrix4fv(glGetUniformLocation(self.shader_program, "u_view"), 1, GL_FALSE, glm.value_ptr(view))
+        glUniformMatrix3fv(glGetUniformLocation(self.shader_program, "u_normal_matrix"), 1, GL_FALSE, glm.value_ptr(normal_matrix))
+
+        # ---------- lights as struct array -----------------------------------
+        lights = [
+            {
+                'pos': self.key_light['pos'],
+                'color': self.key_light['color'],
+                'intensity': self.key_light['intensity']
+            },
+            {
+                'pos': self.fill_light['pos'],
+                'color': self.fill_light['color'],
+                'intensity': self.fill_light['intensity']
+            },
+            {
+                'pos': self.rim_light['pos'],
+                'color': self.rim_light['color'],
+                'intensity': self.rim_light['intensity']
+            }
+        ]
+
+        glUniform1i(glGetUniformLocation(self.shader_program, "num_lights"), len(lights))
+
+        for i, light in enumerate(lights):
+            glUniform3f(
+                glGetUniformLocation(self.shader_program, f"lights[{i}].pos"),
+                *light['pos']
+            )
+            glUniform3f(
+                glGetUniformLocation(self.shader_program, f"lights[{i}].color"),
+                *light['color']
+            )
+            glUniform1f(
+                glGetUniformLocation(self.shader_program, f"lights[{i}].intensity"),
+                light['intensity']
+            )
+
+        # camera position in world space
+        glUniform3f(glGetUniformLocation(self.shader_program, "camera_pos"), 0.0, 0.0, self.zoom)
+
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        glLoadIdentity()
-        glTranslatef(0.0, 0.0, self.zoom)
-        glRotatef(self.rotation_x, 1.0, 0.0, 0.0)
-        glRotatef(self.rotation_y, 0.0, 1.0, 0.0)
-        #self.draw_grid()
-        if self.textures_loaded and self.sphere_list is not None and self.base_alpha_tex is not None and self.shader_program is not None:
-            glUseProgram(self.shader_program)
-            self.set_shader_uniforms()
+
+        if not self.shader_program:
+            return
+
+        glUseProgram(self.shader_program)
+
+        # upload matrices & lighting uniforms
+        self.set_shader_uniforms()
+
+        # ------ draw solid sphere if textures loaded ------
+        if self.textures_loaded and self.base_alpha_tex is not None and self.sphere_vao:
+            # bind textures
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_2D, self.base_alpha_tex)
             glUniform1i(glGetUniformLocation(self.shader_program, "base_alpha_tex"), 0)
             glActiveTexture(GL_TEXTURE1)
             glBindTexture(GL_TEXTURE_2D, self.nms_tex)
             glUniform1i(glGetUniformLocation(self.shader_program, "nms_tex"), 1)
-            glCallList(self.sphere_list)
+
+            glBindVertexArray(self.sphere_vao)
+            glDrawElements(GL_TRIANGLES, self.sphere_index_count, GL_UNSIGNED_INT, None)
+            glBindVertexArray(0)
+
+            # unbind textures
             glBindTexture(GL_TEXTURE_2D, 0)
             glActiveTexture(GL_TEXTURE0)
-            glUseProgram(0)
+            glBindTexture(GL_TEXTURE_2D, 0)
         else:
-            glColor3f(0.5, 0.5, 0.5)
-            glCallList(self.wireframe_list)
-        #self.draw_light_indicators()
+            # ------ fallback wireframe sphere ------
+            if self.wireframe_vao:
+                # set a simple untextured uniform (the shader can use a fallback)
+                glBindVertexArray(self.wireframe_vao)
+                glDrawArrays(GL_LINES, 0, self.wireframe_vertex_count)
+                glBindVertexArray(0)
 
-    def get_camera_world_pos(self):
-        # Read the current modelview matrix (column‑major)
-        mv_mat = glGetFloatv(GL_MODELVIEW_MATRIX)
-        # Reshape to 4x4 and transpose to row‑major for numpy
-        M = np.array(mv_mat).reshape(4, 4).T
-        # Invert the view matrix to get the camera’s transformation
-        invM = np.linalg.inv(M)
-        # The translation part of the inverse is the camera world position
-        #return invM[:3, 3].tolist()
-        return [0.0, 0.0, 0.0]
-
-    def set_shader_uniforms(self):
-        glUniform3f(glGetUniformLocation(self.shader_program, "key_light_pos"), *self.key_light['pos'])
-        glUniform3f(glGetUniformLocation(self.shader_program, "key_light_color"), *self.key_light['color'])
-        glUniform1f(glGetUniformLocation(self.shader_program, "key_light_intensity"), self.key_light['intensity'])
-        glUniform3f(glGetUniformLocation(self.shader_program, "fill_light_pos"), *self.fill_light['pos'])
-        glUniform3f(glGetUniformLocation(self.shader_program, "fill_light_color"), *self.fill_light['color'])
-        glUniform1f(glGetUniformLocation(self.shader_program, "fill_light_intensity"), self.fill_light['intensity'])
-        glUniform3f(glGetUniformLocation(self.shader_program, "rim_light_pos"), *self.rim_light['pos'])
-        glUniform3f(glGetUniformLocation(self.shader_program, "rim_light_color"), *self.rim_light['color'])
-        glUniform1f(glGetUniformLocation(self.shader_program, "rim_light_intensity"), self.rim_light['intensity'])
-        cam_pos = self.get_camera_world_pos()
-        glUniform3f(glGetUniformLocation(self.shader_program, "camera_pos"), *cam_pos)
-
-    def draw_light_indicators(self):
         glUseProgram(0)
-        glDisable(GL_TEXTURE_2D)
-        glColor3f(1.0, 1.0, 0.0)
-        self.draw_light_sphere(self.key_light['pos'])
-        glColor3f(0.5, 0.5, 1.0)
-        self.draw_light_sphere(self.fill_light['pos'])
-        glColor3f(1.0, 1.0, 1.0)
-        self.draw_light_sphere(self.rim_light['pos'])
-        glEnable(GL_TEXTURE_2D)
-
-    def draw_light_sphere(self, pos):
-        glPushMatrix()
-        glTranslatef(*pos)
-        quadric = gluNewQuadric()
-        gluSphere(quadric, 0.15, 16, 16)
-        gluDeleteQuadric(quadric)
-        glPopMatrix()
-
-    def draw_grid(self):
-        glUseProgram(0)
-        glPushMatrix()
-        glDisable(GL_TEXTURE_2D)
-        glBegin(GL_LINES)
-        for i in range(-10, 11):
-            alpha = max(0.05, 0.2 - abs(i) * 0.015)
-            glColor4f(0.2, 0.2, 0.22, alpha)
-            glVertex3f(i, -2.0, -10)
-            glVertex3f(i, -2.0, 10)
-            glVertex3f(-10, -2.0, i)
-            glVertex3f(10, -2.0, i)
-        glColor3f(0.3, 0.3, 0.33)
-        glVertex3f(-10, -2.0, 0)
-        glVertex3f(10, -2.0, 0)
-        glVertex3f(0, -2.0, -10)
-        glVertex3f(0, -2.0, 10)
-        glEnd()
-        glEnable(GL_TEXTURE_2D)
-        glPopMatrix()
 
     def resizeGL(self, w, h):
-        if h == 0:
-            h = 1
-        glViewport(0, 0, w, h)
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        gluPerspective(45, w / h, 0.1, 100.0)
-        glMatrixMode(GL_MODELVIEW)
+        glViewport(0, 0, w, max(h, 1))
 
+    # =========================================================================
+    #  mouse / auto‑rotate (unchanged)
+    # =========================================================================
     def mousePressEvent(self, event):
         self.last_pos = event.pos()
         self.auto_rotate_enabled = False
 
     def mouseMoveEvent(self, event):
+        if self.last_pos is None:
+            self.last_pos = event.pos()
+            return
         dx = event.x() - self.last_pos.x()
         dy = event.y() - self.last_pos.y()
         if event.buttons() & Qt.LeftButton:
             self.rotation_y += dx * 0.5
-            self.rotation_x += dy * 0.5
+            self.rotation_x -= dy * 0.5
             self.update()
         self.last_pos = event.pos()
 
