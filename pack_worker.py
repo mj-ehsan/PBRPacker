@@ -36,9 +36,9 @@ def build_packed_arrays(paths, ao_intensity=1.0, invert_normal_y=False):
     alpha_arr = get_array("Alpha", (255, 255, 255, 255))
     transparency = alpha_arr[..., 0] if "Alpha" in images else base_color[..., 3]
 
-    out_base_ao = np.empty((max_h, max_w, 4), dtype=np.uint8)
-    out_base_ao[..., :3] = np.clip(base_ao_rgb, 0, 255).astype(np.uint8)
-    out_base_ao[..., 3] = np.clip(transparency, 0, 255).astype(np.uint8)
+    out_base_alpha = np.empty((max_h, max_w, 4), dtype=np.uint8)
+    out_base_alpha[..., :3] = np.clip(base_ao_rgb, 0, 255).astype(np.uint8)
+    out_base_alpha[..., 3] = np.clip(transparency, 0, 255).astype(np.uint8)
 
     normal = get_array("Normal", (127, 127, 255, 255))
     if invert_normal_y:
@@ -52,7 +52,7 @@ def build_packed_arrays(paths, ao_intensity=1.0, invert_normal_y=False):
     out_nms[..., 1] = normal[..., 1]
     out_nms[..., 2] = metallic
     out_nms[..., 3] = smoothness
-    return out_base_ao, out_nms
+    return out_base_alpha, out_nms
 
 
 class PackWorker(QThread):
@@ -71,10 +71,10 @@ class PackWorker(QThread):
             self.progress.emit(10, "Loading images...")
             self.progress.emit(50, "Processing BaseAOTransparency...")
             self.progress.emit(70, "Processing NMS...")
-            out_base_ao, out_nms = build_packed_arrays(self.paths, self.ao_intensity, self.invert_normal_y)
+            out_base_alpha, out_nms = build_packed_arrays(self.paths, self.ao_intensity, self.invert_normal_y)
             self.progress.emit(85, "Saving textures...")
             os.makedirs(self.out_dir, exist_ok=True)
-            Image.fromarray(out_base_ao, "RGBA").save(
+            Image.fromarray(out_base_alpha, "RGBA").save(
                 os.path.join(self.out_dir, "BaseAOTransparency.png"),
                 optimize=True,
                 compress_level=9,
@@ -85,6 +85,6 @@ class PackWorker(QThread):
                 compress_level=9,
             )
             self.progress.emit(100, "Done!")
-            self.finished.emit(True, "Textures packed successfully.", out_base_ao, out_nms)
+            self.finished.emit(True, "Textures packed successfully.", out_base_alpha, out_nms)
         except Exception as error:
             self.finished.emit(False, str(error), None, None)
