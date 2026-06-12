@@ -1,39 +1,75 @@
 #version 330
 #extension GL_ARB_derivative_control : require
 
+#define MAX_LIGHTS 16
+
 #define saturate(a) (clamp(a, 0.0, 1.0))
 float max3component (vec3 v) { return max(max(v.x,v.y),v.z); }
 
-uniform sampler2D base_ao_tex;
+uniform sampler2D base_alpha_tex;
 uniform sampler2D nms_tex;
-uniform vec3 key_light_pos;
-uniform vec3 key_light_color;
-uniform float key_light_intensity;
-uniform vec3 fill_light_pos;
-uniform vec3 fill_light_color;
-uniform float fill_light_intensity;
-uniform vec3 rim_light_pos;
-uniform vec3 rim_light_color;
-uniform float rim_light_intensity;
+
 uniform vec3 camera_pos;
 
 in vec3 v_normal;
 in vec3 v_world_pos;
 in vec2 v_uv;
 
-out vec4 FragColor
+out vec4 FragColor;
+
+// Lights as struct array
+struct Light {
+    vec3 pos;
+    vec3 color;
+    float intensity;
+};
+
+uniform Light lights[MAX_LIGHTS];
+uniform int num_lights;
 
 struct Material {
     vec3 normal;
     vec3 base;
     float alpha;
     float metallic;
-    float roughness; 
+    vec3 roughness; //with pow2 and pow4
 };
 
 vec3 Fresnel_Schlick(float cosTheta, vec3 F0)
 {
     return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+
+// Add to your shader:
+float IOR_from_F0(float F0) {
+    float sqrtF0 = sqrt(max(F0, 0.0));
+    return (1.0 + sqrtF0) / max(1.0 - sqrtF0, 0.001);
+}
+
+vec3 Fresnel_Physical(float cosTheta, vec3 F0, float metallic) {
+    cosTheta = abs(cosTheta);  // Fix back-facing issue
+    
+    if (metallic < 0.001) {
+        // Pure dielectric: use exact formula
+        vec3 F = vec3(0.0);
+        for (int i = 0; i < 3; i++) {
+            float ior = IOR_from_F0(F0[i]);
+            float c = cosTheta;
+            float g = sqrt(ior * ior + c * c - 1.0);
+            float gc = g - c;
+            float gp = g + c;
+            F[i] = 0.5 * gc * gc / (gp * gp) * 
+                   (1.0 + ((c * gp - 1.0) * (c * gp - 1.0)) / 
+                          ((c * gc + 1.0) * (c * gc + 1.0)));
+        }
+        return F;
+    } else {
+        // Metallic: use enhanced Schlick with grazing term
+        vec3 F90 = mix(vec3(1.0), F0, 0.5);  // Metals are still reflective at grazing
+        float c = 1.0 - cosTheta;
+        float c5 = c * c * c * c * c;
+        return F0 + (F90 - F0) * c5 * (1.0 + (sqrt(max(F0, 0.0)) - 0.5) * c * (1.0 - c));
+    }
 }
 
 float Fd_Burley(float NoV, float NoL, float VoH, float roughness)
@@ -44,19 +80,16 @@ float Fd_Burley(float NoV, float NoL, float VoH, float roughness)
     return lightScatter * viewScatter;
 }
 
-float D_GGX(float NoH, float alpha)
+float D_GGX(float NoH, float alpha2)
 {
-    float a2 = alpha * alpha;
-    float d = (NoH * NoH) * (a2 - 1.0) + 1.0;
-    return a2 / (3.14159265 * d * d);
+    float d = (NoH * NoH) * (alpha2 - 1.0) + 1.0;
+    return alpha2 / (3.14159265 * d * d);
 }
 
-float G_SmithGGX_Correlated(float NoV, float NoL, float alpha)
+float G_SmithGGX_Correlated(float NoV, float NoL, float alpha2)
 {
-    float a2 = alpha * alpha;
-
-    float denomV = NoL * sqrt(a2 + (1.0 - a2) * NoV * NoV);
-    float denomL = NoV * sqrt(a2 + (1.0 - a2) * NoL * NoL);
+    float denomV = NoL * sqrt(alpha2 + (1.0 - alpha2) * NoV * NoV);
+    float denomL = NoV * sqrt(alpha2 + (1.0 - alpha2) * NoL * NoL);
 
     return (2.0 * NoL * NoV) / max(denomV + denomL, 1e-5);
 }
@@ -68,11 +101,11 @@ vec3 GGX_MultiScatterEnergy(vec3 F0, float roughness)
     return F0 * energyFactor + energyBias;
 }
 
-vec3 apply_lightPBR(vec3 lp, vec3 lc, float li, vec3 V, Material M) {
-    vec3 Lv = lp - v_world_pos;
+vec3 apply_lightPBR(Light light, vec3 V, Material M) {
+    vec3 Lv = light.pos - v_world_pos;
     float Ll = length(Lv);
     float L_atten = 1.0 / max(Ll * Ll, 0.01); //considering a light radius of 0.1 => 0.1^2 = 0.01
-    vec3 radiance = L_atten * lc * li;
+    vec3 radiance = L_atten * light.color * light.intensity;
 
     vec3 L = Lv / Ll;
     vec3 H = normalize(V + L);
@@ -85,20 +118,19 @@ vec3 apply_lightPBR(vec3 lp, vec3 lc, float li, vec3 V, Material M) {
     vec3 dF0 = vec3(0.04,0.04,0.04);
     vec3 F0 = mix(dF0, M.base, vec3(M.metallic));
     
-    float alpha = M.roughness * M.roughness;
-    vec3 F = Fresnel_Schlick(VoH, F0);
+    vec3 F = Fresnel_Physical(VoH, F0, M.metallic);
 
     // ---- Diffuse (Burley, energy aware) ----
-    float Fd = Fd_Burley(NoV, NoL, VoH, M.roughness);
+    float Fd = Fd_Burley(NoV, NoL, VoH, M.roughness.x);
 	vec3 diffuse = (M.base / 3.14159265) * Fd * NoL * (1.0 - M.metallic);
 
     // ---- GGX Specular (height-correlated) ----
-	float D = D_GGX(NoH, alpha);
-	float G = G_SmithGGX_Correlated(NoV, NoL, alpha);
+	float D = D_GGX(NoH, M.roughness.z);
+	float G = G_SmithGGX_Correlated(NoV, NoL, M.roughness.z);
 	vec3 specSingle = (D * G * F) / max(4.0 * NoV, 1e-4);
 
     // ---- Multiscatter compensation ----
-	vec3 Fms = GGX_MultiScatterEnergy(F0, M.roughness);
+	vec3 Fms = GGX_MultiScatterEnergy(F0, M.roughness.x);
 	vec3 specMulti = Fms * mix(NoL * vec3(Fd,Fd,Fd), specSingle, M.metallic);
 
     // ---- Energy balancing ----
@@ -162,43 +194,55 @@ float ApplyNrmVarToRgh(vec3 nrm, vec3 nrm0, float rgh)
     return clamp(rghEff, 0.0, 1.0);
 }
 
+vec3 unpackNormal(in vec2 normal) {
+    vec3 o;
+    o.xy = normal * 2.0 - 1.0;
+    o.z = sqrt(1.0 - normal.x*normal.x - normal.y*normal.y);
+    return o;
+}
+
 void getMaterial (out Material m)
 {
-    vec4 base_alpha = texture2D(base_alpha_tex, v_uv);
-    vec4 nms = texture2D(nms_tex, v_uv);
-    
+    vec4 base_alpha = texture(base_alpha_tex, v_uv);
 
-    vec3 n = vec3(nms.r * 2.0 - 1.0, nms.g * 2.0 - 1.0, 0.0);
-    n.z = sqrt(1.0 - nms.r*nms.r - nms.g*nms.g);
+    vec4 nms = texture(nms_tex, v_uv);
+    
+    vec3 n = unpackNormal(nms.xy);
+    n = ApplyTangentNormal(v_normal, n, v_uv, v_world_pos);
+
+    //after derivative calculation so it doesn't mess with the tangent space basis.
+    //transparenct is mainly handled by AtoC, so this one's just a perf saver.
+    if(base_alpha.a < 1.0 / 255.0) discard;
 
     vec4 nms0 = textureLod(nms_tex, v_uv, 0);
-    vec3 n0 = vec3(nms0.r * 2.0 - 1.0, nms0.g * 2.0 - 1.0, 0.0);
-    n0.z = sqrt(1.0 - nms0.r*nms0.r - nms0.g*nms0.g);
+    vec3 n0 = unpackNormal(nms0.xy);
+
     nms.w = ApplyNrmVarToRgh(n, n0, nms.w);
 
     m.base = base_alpha.rgb;
     m.alpha = base_alpha.a;
     m.normal = n.xyz;
     m.metallic = nms.z;
-    m.roughness = nms.w;
-
-    m.normal = ApplyTangentNormal(v_normal, m.normal, v_uv, v_world_pos);
+    m.roughness.x = nms.w;
+    m.roughness.y = nms.w * nms.w;
+    m.roughness.z = m.roughness.y * m.roughness.y;
 }
 
 void main() {
     Material material;
     getMaterial(material);
+    
 
     vec3 view_dir = normalize(camera_pos - v_world_pos);
 
     vec3 color = vec3(0.0, 0.0, 0.0);
-    color += apply_lightPBR( key_light_pos,  key_light_color,  key_light_intensity, view_dir, material);
-    color += apply_lightPBR(fill_light_pos, fill_light_color, fill_light_intensity, view_dir, material);
-    color += apply_lightPBR( rim_light_pos,  rim_light_color,  rim_light_intensity, view_dir, material);
+    for(int i = 0; i < num_lights; i++) {
+        color += apply_lightPBR(lights[i], view_dir, material);
+    }
 
     float exposure = 3.0;
     color *= pow(2.0, exposure);
     color = ACESFilm(color);
     
-    FragColor = vec4(saturate(color), 1.0);
+    FragColor = vec4(saturate(color), material.alpha);
 }
