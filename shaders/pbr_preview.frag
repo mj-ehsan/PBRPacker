@@ -162,7 +162,7 @@ float ApplyNrmVarToRgh(vec3 nrm, vec3 nrm0, float rgh)
 
 void getMaterial (out Material m)
 {
-    vec4 base_alpha = texture2D(base_ao_tex, v_uv);
+    vec4 base_alpha = texture2D(base_alpha_tex, v_uv);
     vec4 nms = texture2D(nms_tex, v_uv);
     
 

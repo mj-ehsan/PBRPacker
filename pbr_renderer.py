@@ -30,7 +30,7 @@ class PBRRendererWidget(QOpenGLWidget):
         self.rim_light = {'pos': [-2.0, 4.0, -7.0], 'color': [0.95, 0.98, 1.0], 'intensity': 9.0}
         self.ao_intensity = 1.0
         self.invert_normal_y = False
-        self.base_ao_tex = None
+        self.base_alpha_tex = None
         self.nms_tex = None
         self.textures_loaded = False
         self.preview_mode = "input"
@@ -111,8 +111,8 @@ class PBRRendererWidget(QOpenGLWidget):
         self.sphere_list = glGenLists(1)
         glNewList(self.sphere_list, GL_COMPILE)
         radius = 1.5
-        slices = 128
-        stacks = 128
+        slices = 32
+        stacks = 16
         for i in range(stacks):
             lat0 = math.pi * (-0.5 + float(i) / stacks)
             z0 = math.sin(lat0)
@@ -245,11 +245,11 @@ class PBRRendererWidget(QOpenGLWidget):
 
     def upload_texture_set(self, base_ao_data, nms_data):
         self.makeCurrent()
-        if self.base_ao_tex is not None:
-            glDeleteTextures([self.base_ao_tex])
+        if self.base_alpha_tex is not None:
+            glDeleteTextures([self.base_alpha_tex])
         if self.nms_tex is not None:
             glDeleteTextures([self.nms_tex])
-        self.base_ao_tex = self.create_gl_texture(base_ao_data)
+        self.base_alpha_tex = self.create_gl_texture(base_ao_data)
         self.nms_tex = self.create_gl_texture(nms_data)
         self.textures_loaded = True
         self.doneCurrent()
@@ -311,12 +311,12 @@ class PBRRendererWidget(QOpenGLWidget):
         glRotatef(self.rotation_x, 1.0, 0.0, 0.0)
         glRotatef(self.rotation_y, 0.0, 1.0, 0.0)
         #self.draw_grid()
-        if self.textures_loaded and self.sphere_list is not None and self.base_ao_tex is not None and self.shader_program is not None:
+        if self.textures_loaded and self.sphere_list is not None and self.base_alpha_tex is not None and self.shader_program is not None:
             glUseProgram(self.shader_program)
             self.set_shader_uniforms()
             glActiveTexture(GL_TEXTURE0)
-            glBindTexture(GL_TEXTURE_2D, self.base_ao_tex)
-            glUniform1i(glGetUniformLocation(self.shader_program, "base_ao_tex"), 0)
+            glBindTexture(GL_TEXTURE_2D, self.base_alpha_tex)
+            glUniform1i(glGetUniformLocation(self.shader_program, "base_alpha_tex"), 0)
             glActiveTexture(GL_TEXTURE1)
             glBindTexture(GL_TEXTURE_2D, self.nms_tex)
             glUniform1i(glGetUniformLocation(self.shader_program, "nms_tex"), 1)
