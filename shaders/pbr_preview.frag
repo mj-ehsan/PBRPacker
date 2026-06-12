@@ -1,4 +1,5 @@
 #version 130
+#extension GL_ARB_derivative_control : require
 
 #define saturate(a) (clamp(a, 0.0, 1.0))
 
@@ -99,10 +100,10 @@ vec3 apply_lightPBR(vec3 lp, vec3 lc, float li, vec3 N, vec3 V, vec3 a, float m,
 vec3 ApplyTangentNormal(vec3 O_Normal, vec3 T_Normal, vec2 uv, vec3 WorldPos)
 {
     // Get derivatives
-    vec3 dp1 = dFdx(WorldPos);
-    vec3 dp2 = dFdy(WorldPos);
-    vec2 duv1 = dFdx(uv);
-    vec2 duv2 = dFdy(uv);
+    vec3 dp1 = dFdxFine(WorldPos);
+    vec3 dp2 = dFdyFine(WorldPos);
+    vec2 duv1 = dFdxFine(uv);
+    vec2 duv2 = dFdyFine(uv);
     
     // Solve for tangent and bitangent
     vec3 N = normalize(O_Normal);
@@ -150,11 +151,33 @@ float ApplyNrmVarToRgh(vec3 nrm, vec3 nrm0, float rgh)
     return clamp(rghEff, 0.0, 1.0);
 }
 
+struct Material {
+    vec3 normal;
+    vec3 base;
+    float alpha;
+    float metallic;
+    float roughness; 
+};
+
+void getMaterial (out Material m)
+{
+    vec4 base_alpha = texture2D(base_ao_tex, v_uv);
+    vec4 nms = texture2D(nms_tex, v_uv);
+
+    vec3 n = vec3(nms.r * 2.0 - 1.0, nms.g * 2.0 - 1.0, 0.0);
+    n.z = sqrt(1.0 - nms.r*nms.r - nms.g*nms.g);
+
+    m.base = base_alpha.rgb;
+    m.alpha = base_alpha.a;
+    m.normal = n.xyz;
+    m.metallic = nms.z;
+    m.roughness = nms.w;
+}
+
 void main() {
     vec4 base_ao = texture2D(base_ao_tex, v_uv);
     vec4 nms = texture2D(nms_tex, v_uv);
     vec4 nms0 = textureLod(nms_tex, v_uv, 0);
-
 
     vec3 albedo = base_ao.rgb;
 
