@@ -413,7 +413,7 @@ class PBRRendererWidget(QOpenGLWidget):
         )
 
         mvp = projection * view * model
-        normal_matrix = glm.transpose(glm.inverse(glm.mat3(view * model)))
+        normal_matrix = glm.transpose(glm.inverse(glm.mat3(model)))
 
         glUniformMatrix4fv(glGetUniformLocation(self.shader_program, "u_mvp"), 1, GL_FALSE, glm.value_ptr(mvp))
         glUniformMatrix4fv(glGetUniformLocation(self.shader_program, "u_model"), 1, GL_FALSE, glm.value_ptr(model))
@@ -528,6 +528,7 @@ class PBRRendererWidget(QOpenGLWidget):
         self.update()
 
     def auto_rotate(self):
+        self.auto_rotate_enabled = False
         if self.auto_rotate_enabled:
             self.rotation_y += 0.5
             if self.rotation_y >= 360:
