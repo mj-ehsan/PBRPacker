@@ -110,8 +110,6 @@ class PBRRendererWidget(QOpenGLWidget):
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         #glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE)
 
-        #self.CompositionWorker.connect_composition_signal()
-
         self.check_anisotropy_support()
         self.create_sphere_geometry()
         self.create_wireframe_sphere_geometry()
@@ -119,7 +117,7 @@ class PBRRendererWidget(QOpenGLWidget):
         self.compose_requested = True
         self.timer.start(16)
 
-    # ---- shader loading (unchanged) -------------------------------------------------
+    # ---- shader loading -------------------------------------------------
     def load_shader_source(self, filename):
         shader_path = os.path.join(self.shader_dir, filename)
         with open(shader_path, "r", encoding="utf-8") as shader_file:
@@ -149,7 +147,30 @@ class PBRRendererWidget(QOpenGLWidget):
     def create_shader_programs(self):
         self.shader_program = self.create_shader_program("pbr_preview.vert", "pbr_preview.frag")
         self.compose_shader_program = self.create_shader_program("compose.vert", "compose.frag")
-        self.compose_vao = glGenVertexArrays(1)
+        # create a full-screen triangle VAO for the compose pass
+        self.compose_vao = self.create_fullscreen_quad_vao()
+
+    def create_fullscreen_quad_vao(self):
+        """Create a VAO containing a large triangle covering the whole screen."""
+        vao = glGenVertexArrays(1)
+        glBindVertexArray(vao)
+
+        # a triangle that covers the clip space from -1 to 3 in x and -1 to 3 in y
+        # This is a common trick to avoid a full quad.
+        vertices = np.array([
+            -1.0, -1.0,
+             3.0, -1.0,
+            -1.0,  3.0
+        ], dtype=np.float32)
+
+        vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        glBufferData(GL_ARRAY_BUFFER, vertices.tobytes(), GL_STATIC_DRAW)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(0)
+
+        glBindVertexArray(0)
+        return vao
 
     # ---- anisotropy support ----------------------------------------------------------
     def check_anisotropy_support(self):
@@ -169,7 +190,7 @@ class PBRRendererWidget(QOpenGLWidget):
             self.max_anisotropy = 1.0
 
     # =========================================================================
-    #  NEW: VAO‑based sphere creation
+    #  Sphere geometry creation
     # =========================================================================
     def create_sphere_geometry(self):
         radius = 1.5
@@ -178,10 +199,10 @@ class PBRRendererWidget(QOpenGLWidget):
 
         vertices = []
         normals = []
+        tangents = []
         texcoords = []
         indices = []
 
-        # generate vertices, normals, texcoords
         for i in range(stacks + 1):
             lat = math.pi * (-0.5 + float(i) / stacks)
             z = math.sin(lat)
@@ -192,9 +213,16 @@ class PBRRendererWidget(QOpenGLWidget):
                 y = math.sin(lng)
                 vertices.extend([x * zr * radius, y * zr * radius, z * radius])
                 normals.extend([x * zr, y * zr, z])        # unit length
+
+                # tangent = derivative w.r.t. lng (u direction)
+                tx = -math.sin(lng)
+                ty =  math.cos(lng)
+                tz = 0.0
+                # (tx, ty, tz) is already normalised and orthogonal to normal
+                tangents.extend([tx, ty, tz])
+                
                 texcoords.extend([float(j) / slices, float(i) / stacks])
 
-        # generate indices for triangle strips
         for i in range(stacks):
             for j in range(slices):
                 first = i * (slices + 1) + j
@@ -204,41 +232,39 @@ class PBRRendererWidget(QOpenGLWidget):
 
         self.sphere_index_count = len(indices)
 
-        # --- VAO ---
         self.sphere_vao = glGenVertexArrays(1)
         glBindVertexArray(self.sphere_vao)
 
-        # vertex buffer
         self.sphere_vbo_vertices = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.sphere_vbo_vertices)
         glBufferData(GL_ARRAY_BUFFER, np_to_gl_array(np.array(vertices)), GL_STATIC_DRAW)
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
         glEnableVertexAttribArray(0)
 
-        # normal buffer
         self.sphere_vbo_normals = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.sphere_vbo_normals)
         glBufferData(GL_ARRAY_BUFFER, np_to_gl_array(np.array(normals)), GL_STATIC_DRAW)
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, None)
         glEnableVertexAttribArray(1)
 
-        # texcoord buffer
         self.sphere_vbo_texcoords = glGenBuffers(1)
         glBindBuffer(GL_ARRAY_BUFFER, self.sphere_vbo_texcoords)
         glBufferData(GL_ARRAY_BUFFER, np_to_gl_array(np.array(texcoords)), GL_STATIC_DRAW)
         glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, None)
         glEnableVertexAttribArray(2)
 
-        # index buffer
+        self.sphere_vbo_tangents = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.sphere_vbo_tangents)
+        glBufferData(GL_ARRAY_BUFFER, np_to_gl_array(np.array(tangents)), GL_STATIC_DRAW)
+        glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(3)
+
         self.sphere_ebo = glGenBuffers(1)
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.sphere_ebo)
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, np.array(indices, dtype=np.uint32).tobytes(), GL_STATIC_DRAW)
 
         glBindVertexArray(0)
 
-    # =========================================================================
-    #  NEW: VAO‑based wireframe sphere (just lines)
-    # =========================================================================
     def create_wireframe_sphere_geometry(self):
         radius = 1.5
         slices = 32
@@ -253,7 +279,6 @@ class PBRRendererWidget(QOpenGLWidget):
             for j in range(slices):
                 lng = 2 * math.pi * float(j) / slices
                 vertices.extend([r * math.cos(lng), r * math.sin(lng), z])
-                # next point
                 lng2 = 2 * math.pi * float(j + 1) / slices
                 vertices.extend([r * math.cos(lng2), r * math.sin(lng2), z])
 
@@ -283,6 +308,7 @@ class PBRRendererWidget(QOpenGLWidget):
         glEnableVertexAttribArray(0)
         glBindVertexArray(0)
 
+    # ---- texture input ----------------------------------------------------------
     def load_input_texture(self, name, path):
         if path and os.path.exists(path):
             try:
@@ -414,6 +440,7 @@ class PBRRendererWidget(QOpenGLWidget):
         self.compose_size = (width, height)
 
     def run_compose_pass(self):
+        """Execute the compose shader to populate base_alpha_tex and nms_tex."""
         if self.compose_shader_program is None:
             return
 
@@ -452,6 +479,7 @@ class PBRRendererWidget(QOpenGLWidget):
         glBindVertexArray(0)
         glUseProgram(0)
 
+        # generate mipmaps for the output textures
         glBindTexture(GL_TEXTURE_2D, self.base_alpha_tex)
         glGenerateMipmap(GL_TEXTURE_2D)
         glBindTexture(GL_TEXTURE_2D, self.nms_tex)
@@ -466,6 +494,7 @@ class PBRRendererWidget(QOpenGLWidget):
         self.textures_loaded = True
         self.compose_requested = False
 
+    # ---- public methods for parameter changes ---------------------------------
     def set_ao_intensity(self, intensity):
         self.ao_intensity = intensity
         self.request_refresh()
@@ -480,6 +509,7 @@ class PBRRendererWidget(QOpenGLWidget):
         self.request_refresh()
 
     def set_packed_textures(self, base_alpha_data, nms_data):
+        """Directly set pre-composed textures (packed mode)."""
         self.packed_base_alpha_data = base_alpha_data
         self.packed_nms_data = nms_data
         self.preview_mode = "packed"
@@ -499,11 +529,56 @@ class PBRRendererWidget(QOpenGLWidget):
         self.preview_mode = "input"
         self.request_refresh()
 
-    # =========================================================================
-    #  NEW: uniform setup + drawing
-    # =========================================================================
+    # ---- retrieve the generated normal map for export -------------------------
+    def get_composed_normal_data(self):
+        """
+        Ensure the compose pass has run and return the normal map as a numpy RGBA array.
+        If no compose has been performed yet (e.g., in packed mode the data is already
+        available), it will still read back from nms_tex.
+        """
+        # Force a compose if we are in input mode and not using external packed textures
+        if self.preview_mode == "input" and not self.external_packed_mode:
+            self.run_compose_pass()
+
+        if self.nms_tex is None:
+            raise RuntimeError("No normal texture available yet.")
+
+        width, height = self.compose_size
+        pixels = np.zeros((height, width, 4), dtype=np.uint8)
+
+        # Bind the FBO and read from the second color attachment (nms_tex)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, self.compose_fbo if self.compose_fbo else 0)
+        glReadBuffer(GL_COLOR_ATTACHMENT1)
+        glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
+
+        # OpenGL origin is bottom-left, flip vertically for conventional image storage
+        return np.flipud(pixels)
+ 
+    def get_composed_data(self):
+        """Return (base_alpha_array, nms_array) as numpy uint8 RGBA arrays."""
+        self.makeCurrent()                                # ★ ensure context is current
+        try:
+            if self.preview_mode == "input" and not self.external_packed_mode:
+                self.run_compose_pass()
+
+            width, height = self.compose_size
+            base = np.zeros((height, width, 4), dtype=np.uint8)
+            nms = np.zeros((height, width, 4), dtype=np.uint8)
+
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, self.compose_fbo)
+            glReadBuffer(GL_COLOR_ATTACHMENT0)
+            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, base)
+            glReadBuffer(GL_COLOR_ATTACHMENT1)
+            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, nms)
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
+
+            return np.flipud(base), np.flipud(nms)
+        finally:
+            self.doneCurrent()                             # ★ release context
+
+    # ---- main rendering --------------------------------------------------------
     def set_shader_uniforms(self):
-        # ---------- matrices ------------------------------------------------
         model = (
             glm.rotate(glm.mat4(1.0), glm.radians(self.rotation_x), glm.vec3(1, 0, 0)) *
             glm.rotate(glm.mat4(1.0), glm.radians(self.rotation_y), glm.vec3(0, 1, 0))
@@ -528,7 +603,6 @@ class PBRRendererWidget(QOpenGLWidget):
         glUniformMatrix4fv(glGetUniformLocation(self.shader_program, "u_view"), 1, GL_FALSE, glm.value_ptr(view))
         glUniformMatrix3fv(glGetUniformLocation(self.shader_program, "u_normal_matrix"), 1, GL_FALSE, glm.value_ptr(normal_matrix))
 
-        # ---------- lights as struct array -----------------------------------
         lights = [
             {
                 'pos': self.key_light['pos'],
@@ -563,7 +637,6 @@ class PBRRendererWidget(QOpenGLWidget):
                 light['intensity']
             )
 
-        # camera position in world space
         glUniform3f(glGetUniformLocation(self.shader_program, "camera_pos"), 0.0, 0.0, self.zoom)
 
     def paintGL(self):
@@ -576,13 +649,9 @@ class PBRRendererWidget(QOpenGLWidget):
             self.run_compose_pass()
 
         glUseProgram(self.shader_program)
-
-        # upload matrices & lighting uniforms
         self.set_shader_uniforms()
 
-        # ------ draw solid sphere if textures loaded ------
         if self.textures_loaded and self.base_alpha_tex is not None and self.sphere_vao:
-            # bind textures
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_2D, self.base_alpha_tex)
             glUniform1i(glGetUniformLocation(self.shader_program, "base_alpha_tex"), 0)
@@ -594,14 +663,11 @@ class PBRRendererWidget(QOpenGLWidget):
             glDrawElements(GL_TRIANGLES, self.sphere_index_count, GL_UNSIGNED_INT, None)
             glBindVertexArray(0)
 
-            # unbind textures
             glBindTexture(GL_TEXTURE_2D, 0)
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_2D, 0)
         else:
-            # ------ fallback wireframe sphere ------
             if self.wireframe_vao:
-                # set a simple untextured uniform (the shader can use a fallback)
                 glBindVertexArray(self.wireframe_vao)
                 glDrawArrays(GL_LINES, 0, self.wireframe_vertex_count)
                 glBindVertexArray(0)
@@ -611,9 +677,7 @@ class PBRRendererWidget(QOpenGLWidget):
     def resizeGL(self, w, h):
         glViewport(0, 0, w, max(h, 1))
 
-    # =========================================================================
-    #  mouse / auto‑rotate (unchanged)
-    # =========================================================================
+    # ---- mouse / auto‑rotate ---------------------------------------------------
     def mousePressEvent(self, event):
         self.last_pos = event.pos()
         self.auto_rotate_enabled = False

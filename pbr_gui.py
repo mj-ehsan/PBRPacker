@@ -440,9 +440,15 @@ class MainWindow(QMainWindow):
             self.select_output()
             if not self.out_dir:
                 return
+
+        # Retrieve the final composed textures from the GPU
+        base_alpha, nms = self.pbr_renderer.get_composed_data()
+
         self.btn_pack.setEnabled(False)
         self.progress_bar.show()
-        self.worker = self.worker_class(self.paths, self.out_dir, self.ao_intensity, self.invert_normal_y)
+
+        # New worker expects (base_alpha_array, nms_array, out_dir)
+        self.worker = self.worker_class(base_alpha, nms, self.out_dir)
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.packing_finished)
         self.worker.start()

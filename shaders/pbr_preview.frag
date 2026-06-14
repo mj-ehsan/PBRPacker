@@ -12,6 +12,7 @@ uniform sampler2D nms_tex;
 uniform vec3 camera_pos;
 
 in vec3 v_normal;
+in vec3 v_tangent;
 in vec3 v_world_pos;
 in vec2 v_uv;
 
@@ -140,24 +141,13 @@ vec3 apply_lightPBR(Light light, vec3 V, Material M) {
     return (diffuseBalanced + specular) * radiance;
 }
 
-vec3 ApplyTangentNormal(vec3 O_Normal, vec3 T_Normal, vec2 uv, vec3 WorldPos)
+vec3 ApplyTangentNormal(vec3 O_Normal, vec3 T_Normal)
 {
-    // Get derivatives
-    vec3 dp1 = dFdxFine(WorldPos);
-    vec3 dp2 = dFdyFine(WorldPos);
-    vec2 duv1 = dFdxFine(uv);
-    vec2 duv2 = dFdyFine(uv);
-    
-    // Solve for tangent and bitangent
+    vec3 T = normalize(v_tangent);
     vec3 N = normalize(O_Normal);
-    vec3 T = normalize(dp1 * duv2.y - dp2 * duv1.y);
-    vec3 B = normalize(dp2 * duv1.x - dp1 * duv2.x);
-    
-    // Orthonormalize
     T = normalize(T - N * dot(N, T));
-    B = cross(N, T);
-    
-    // Apply tangent space normal
+    vec3 B = cross(N, T);
+
     mat3 TBN = mat3(T, B, N);
 
     return normalize(TBN * T_Normal);
@@ -173,11 +163,6 @@ vec3 ACESFilm(vec3 x)
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
-// Apply normal map variance to roughness
-// nrm: current filtered normal (normalized, from mip N)
-// nrm0: base normal from mip 0 (normalized, highest detail)
-// rgh: base roughness [0,1]
-// returns: modified roughness with variance applied
 float ApplyNrmVarToRgh(vec3 nrm, vec3 nrm0, float rgh)
 {
     float d = dot(nrm, nrm0);
@@ -208,7 +193,7 @@ void getMaterial (out Material m)
     vec4 nms = texture(nms_tex, v_uv);
     
     vec3 n = unpackNormal(nms.xy);
-    n = ApplyTangentNormal(v_normal, n, v_uv, v_world_pos);
+    n = ApplyTangentNormal(v_normal, n);
 
     //after derivative calculation so it doesn't mess with the tangent space basis.
     //transparenct is mainly handled by AtoC, so this one's just a perf saver.
