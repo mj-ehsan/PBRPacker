@@ -21,9 +21,7 @@ class CompositionWorker(QThread):
 
     def __init__(self, renderer):
         super().__init__()
-        # copy all needed data because we'll run in a different thread
-        self.input_textures = {k: v.copy() if v is not None else None
-                               for k, v in renderer.input_textures.items()}
+        self.input_textures = renderer.input_textures.copy()
         self.ao_intensity = renderer.ao_intensity
         self.invert_normal_y = renderer.invert_normal_y
         self.default_colors = {
