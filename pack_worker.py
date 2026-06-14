@@ -3,6 +3,7 @@ import os
 import numpy as np
 from PIL import Image
 from PyQt5.QtCore import QThread, pyqtSignal
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def build_packed_arrays(paths, ao_intensity=1.0, invert_normal_y=False):
@@ -71,20 +72,32 @@ class PackWorker(QThread):
             self.progress.emit(10, "Loading images...")
             self.progress.emit(50, "Processing BaseAOTransparency...")
             self.progress.emit(70, "Processing NMS...")
-            out_base_alpha, out_nms = build_packed_arrays(self.paths, self.ao_intensity, self.invert_normal_y)
-            self.progress.emit(85, "Saving textures...")
+            out_base_alpha, out_nms = build_packed_arrays(
+                self.paths, self.ao_intensity, self.invert_normal_y
+            )
+            self.progress.emit(85, "Saving textures (multithreaded)...")
             os.makedirs(self.out_dir, exist_ok=True)
-            Image.fromarray(out_base_alpha, "RGBA").save(
-                os.path.join(self.out_dir, "BaseAOTransparency.png"),
-                optimize=True,
-                compress_level=9,
-            )
-            Image.fromarray(out_nms, "RGBA").save(
-                os.path.join(self.out_dir, "NMS.png"),
-                optimize=True,
-                compress_level=9,
-            )
+
+            # ---- parallel saving ----
+            base_path = os.path.join(self.out_dir, "BaseAOTransparency.png")
+            nms_path  = os.path.join(self.out_dir, "NMS.png")
+
+            def save_image(array, filepath):
+                Image.fromarray(array, "RGBA").save(
+                    filepath, optimize=True, compress_level=9
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(save_image, out_base_alpha, base_path),
+                    executor.submit(save_image, out_nms, nms_path),
+                ]
+                # Wait for both to finish, re-raise any exception
+                for future in as_completed(futures):
+                    future.result()   # will raise if the save failed
+
             self.progress.emit(100, "Done!")
-            self.finished.emit(True, "Textures packed successfully.", out_base_alpha, out_nms)
+            self.finished.emit(True, "Textures packed successfully.",
+                               out_base_alpha, out_nms)
         except Exception as error:
             self.finished.emit(False, str(error), None, None)
