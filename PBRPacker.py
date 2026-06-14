@@ -9,10 +9,11 @@ from pbr_gui import MainWindow
 
 if __name__ == "__main__":
     fmt = QSurfaceFormat()
-    fmt.setVersion(2, 1)
-    fmt.setProfile(QSurfaceFormat.CompatibilityProfile)
+    fmt.setVersion(3, 3)
+    fmt.setProfile(QSurfaceFormat.CoreProfile)
     fmt.setSwapBehavior(QSurfaceFormat.DoubleBuffer)
     fmt.setDepthBufferSize(24)
+    fmt.setSamples(8)
     QSurfaceFormat.setDefaultFormat(fmt)
     
     app = QApplication(sys.argv)
