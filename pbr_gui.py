@@ -131,6 +131,8 @@ class MainWindow(QMainWindow):
         self.resize(1400, 800)
         self.mouse_pos = None
         self.ao_intensity = 1.0
+        self.normal_gen_sigma = 1.0
+        self.normal_gen_height = 1.0
         self.invert_normal_y = False
         self.setMouseTracking(True)
         noise_size = 256
@@ -200,6 +202,28 @@ class MainWindow(QMainWindow):
         self.ao_slider.setValue(100)
         self.ao_slider.valueChanged.connect(self.update_ao_intensity)
         material_layout.addWidget(self.ao_slider)
+        sigma_label_layout = QHBoxLayout()
+        sigma_label_layout.addWidget(QLabel("Normal Sigma"))
+        self.normal_sigma_value_label = QLabel("1.00")
+        self.normal_sigma_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        sigma_label_layout.addWidget(self.normal_sigma_value_label)
+        material_layout.addLayout(sigma_label_layout)
+        self.normal_sigma_slider = QSlider(Qt.Horizontal)
+        self.normal_sigma_slider.setRange(1, 500)
+        self.normal_sigma_slider.setValue(100)
+        self.normal_sigma_slider.valueChanged.connect(self.update_normal_generation)
+        material_layout.addWidget(self.normal_sigma_slider)
+        height_label_layout = QHBoxLayout()
+        height_label_layout.addWidget(QLabel("Normal Height"))
+        self.normal_height_value_label = QLabel("1.00")
+        self.normal_height_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        height_label_layout.addWidget(self.normal_height_value_label)
+        material_layout.addLayout(height_label_layout)
+        self.normal_height_slider = QSlider(Qt.Horizontal)
+        self.normal_height_slider.setRange(0, 200)
+        self.normal_height_slider.setValue(100)
+        self.normal_height_slider.valueChanged.connect(self.update_normal_generation)
+        material_layout.addWidget(self.normal_height_slider)
         material_group.setLayout(material_layout)
         left_layout.addWidget(material_group)
 
@@ -280,6 +304,15 @@ class MainWindow(QMainWindow):
         self.ao_value_label.setText(f"{self.ao_intensity:.2f}x")
         self.pbr_renderer.use_input_preview()
         self.pbr_renderer.set_ao_intensity(self.ao_intensity)
+        self.preview_mode_label.setText("Previewing live input textures")
+
+    def update_normal_generation(self):
+        self.normal_gen_sigma = self.normal_sigma_slider.value() / 100.0
+        self.normal_gen_height = self.normal_height_slider.value() / 100.0
+        self.normal_sigma_value_label.setText(f"{self.normal_gen_sigma:.2f}")
+        self.normal_height_value_label.setText(f"{self.normal_gen_height:.2f}")
+        self.pbr_renderer.use_input_preview()
+        self.pbr_renderer.set_normal_generation(self.normal_gen_sigma, self.normal_gen_height)
         self.preview_mode_label.setText("Previewing live input textures")
 
     def reset_view(self):

@@ -1,10 +1,9 @@
 import math
 import os
-import ctypes
 import numpy as np
 import glm
 from PIL import Image
-from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtWidgets import QOpenGLWidget
 from PyQt5.QtGui import QSurfaceFormat
 from OpenGL.GL import *
@@ -16,119 +15,22 @@ def np_to_gl_array(arr, dtype=np.float32):
     return arr.astype(dtype).flatten().tobytes()
 # ----------------------------------------------------------------------
 
-class CompositionWorker(QThread):
-    resultReady = pyqtSignal(np.ndarray, np.ndarray)
-
-    def __init__(self, renderer):
-        super().__init__()
-        self.input_textures = renderer.input_textures.copy()
-        self.ao_intensity = renderer.ao_intensity
-        self.invert_normal_y = renderer.invert_normal_y
-        self.default_colors = {
-            "BaseColor": [255, 255, 255, 255],
-            "AO": [255, 255, 255, 255],
-            "Metallic": [0, 0, 0, 255],
-            "Smoothness": [127, 127, 127, 255],
-            "Normal": [127, 127, 255, 255],
-            "Alpha": [255, 255, 255, 255],
-        }
-
-    def run(self):
-        # identical logic to the old compose_live_texture_set,
-        # but using self.input_textures etc.
-        # (Move the entire compose_live_texture_set here, returning base_ao_data, nms_data)
-        base_ao_data, nms_data = self.compose()
-        self.resultReady.emit(base_ao_data, nms_data)
-
-    def create_default_texture(self, color):
-        return np.array([[color]], dtype=np.uint8)
-    
-    def apply_normal_y_inversion(self, normal):
-        if not self.invert_normal_y:
-            return normal
-        inverted = normal.copy()
-        inverted[..., 1] = 255 - inverted[..., 1]
-        return inverted
-    
-    def compose(self):
-        base_color = self.input_textures["BaseColor"]
-        if base_color is None:
-            base_color = self.create_default_texture([255, 255, 255, 255])
-        ao = self.input_textures["AO"]
-        if ao is None:
-            ao = self.create_default_texture([255, 255, 255, 255])
-        metallic = self.input_textures["Metallic"]
-        if metallic is None:
-            metallic = self.create_default_texture([0, 0, 0, 255])
-        smoothness = self.input_textures["Smoothness"]
-        if smoothness is None:
-            smoothness = self.create_default_texture([127, 127, 127, 255])
-        normal = self.input_textures["Normal"]
-        if normal is None:
-            normal = self.create_default_texture([127, 127, 255, 255])
-        alpha = self.input_textures["Alpha"]
-        if alpha is None:
-            alpha = self.create_default_texture([255, 255, 255, 255])
-
-        max_h = max(tex.shape[0] for tex in [base_color, ao, metallic, smoothness, normal, alpha])
-        max_w = max(tex.shape[1] for tex in [base_color, ao, metallic, smoothness, normal, alpha])
-
-        def resize_texture(texture, width, height):
-            if texture.shape[0] != height or texture.shape[1] != width:
-                image = Image.fromarray(texture)
-                image = image.resize((width, height), Image.Resampling.LANCZOS)
-                return np.array(image, dtype=np.float32)
-            return texture.astype(np.float32)
-
-        base_color = resize_texture(base_color, max_w, max_h)
-        ao = resize_texture(ao, max_w, max_h)
-        metallic = resize_texture(metallic, max_w, max_h)
-        smoothness = resize_texture(smoothness, max_w, max_h)
-        normal = resize_texture(normal, max_w, max_h)
-        alpha = resize_texture(alpha, max_w, max_h)
-        normal = self.apply_normal_y_inversion(normal)
-
-        ao_channel = np.clip((ao[..., 0] / 255.0) ** max(self.ao_intensity, 0.00001), 0.0, 1.0)
-        base_ao_rgb = base_color[..., :3] * ao_channel[..., np.newaxis]
-        transparency = alpha[..., 0] if self.input_textures["Alpha"] is not None else base_color[..., 3]
-
-        base_ao_data = np.zeros((max_h, max_w, 4), dtype=np.uint8)
-        base_ao_data[..., :3] = np.clip(base_ao_rgb, 0, 255).astype(np.uint8)
-        base_ao_data[..., 3] = np.clip(transparency, 0, 255).astype(np.uint8)
-
-        nms_data = np.zeros((max_h, max_w, 4), dtype=np.uint8)
-        nms_data[..., 0] = normal[..., 0]
-        nms_data[..., 1] = normal[..., 1]
-        nms_data[..., 2] = metallic[..., 0]
-        nms_data[..., 3] = smoothness[..., 0]
-        return base_ao_data, nms_data
-
-    # Connect the worker inside __init__
-    def connect_composition_signal(self):
-        # This method must be called once after the widget is created
-        pass   # We'll wire it in initializeGL or after
-
-    # In start_composition_thread:
-    def start_composition_thread(self):
-        if not self.pending_composition:
-            return
-        self.pending_composition = False
-        self.worker = CompositionWorker(self)
-        self.worker.resultReady.connect(self.on_composition_done)
-        self.worker.start()
-
-    # Slot to upload the textures in the GUI thread
-    def on_composition_done(self, base_ao_data, nms_data):
-        self.upload_texture_set(base_ao_data, nms_data)
-
 class PBRRendererWidget(QOpenGLWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
         self.pending_composition = False
+        self.compose_requested = False
+        self.compose_vao = None
+        self.compose_fbo = None
+        self.compose_size = (0, 0)
+        self.compose_source_textures = {}
+        self.compose_source_size = (1, 1)
+        self.default_texture_cache = {}
+        self.external_packed_mode = False
         self.composition_timer = QTimer()
         self.composition_timer.setSingleShot(True)
-        self.composition_timer.timeout.connect(self.start_composition_thread)
+        self.composition_timer.timeout.connect(self.schedule_compose_pass)
 
         fmt = QSurfaceFormat()
         fmt.setSamples(8)
@@ -146,6 +48,8 @@ class PBRRendererWidget(QOpenGLWidget):
         self.fill_light = {'pos': [-5.0, 1.5, 2.5], 'color': [0.65, 0.75, 1.0], 'intensity': 4.5}
         self.rim_light = {'pos': [-2.0, 4.0, -7.0], 'color': [0.95, 0.98, 1.0], 'intensity': 9.0}
         self.ao_intensity = 1.0
+        self.normal_gen_sigma = 1.0
+        self.normal_gen_height = 1.0
         self.invert_normal_y = False
         self.base_alpha_tex = None
         self.nms_tex = None
@@ -178,29 +82,25 @@ class PBRRendererWidget(QOpenGLWidget):
         self.max_anisotropy = 1.0
 
         self.shader_program = None
+        self.compose_shader_program = None
         self.shader_dir = os.path.join(os.path.dirname(__file__), "shaders")
 
         self.timer = QTimer()
-        self.timer.timeout.connect(self.auto_rotate)
+        self.timer.timeout.connect(self.tick_preview)
         self.auto_rotate_enabled = True
 
-    # In start_composition_thread:
-    def start_composition_thread(self):
+    def schedule_compose_pass(self):
         if not self.pending_composition:
             return
         self.pending_composition = False
-        self.worker = CompositionWorker(self)
-        self.worker.resultReady.connect(self.on_composition_done)
-        self.worker.start()
-
-    # Slot to upload the textures in the GUI thread
-    def on_composition_done(self, base_ao_data, nms_data):
-        self.upload_texture_set(base_ao_data, nms_data)
+        self.compose_requested = True
+        self.update()
 
     def request_refresh(self):
-        """Debounce texture changes and start a worker thread."""
+        """Debounce texture changes and schedule a single compose pass."""
+        self.external_packed_mode = False
         self.pending_composition = True
-        self.composition_timer.start(50)   # 50 ms delay, adjust as needed
+        self.composition_timer.start(50)
 
     def initializeGL(self):
         glEnable(GL_MULTISAMPLE)
@@ -215,8 +115,8 @@ class PBRRendererWidget(QOpenGLWidget):
         self.check_anisotropy_support()
         self.create_sphere_geometry()
         self.create_wireframe_sphere_geometry()
-        self.create_shader_program()
-        self.refresh_preview_textures()
+        self.create_shader_programs()
+        self.compose_requested = True
         self.timer.start(16)
 
     # ---- shader loading (unchanged) -------------------------------------------------
@@ -233,31 +133,37 @@ class PBRRendererWidget(QOpenGLWidget):
             raise RuntimeError(glGetShaderInfoLog(shader).decode())
         return shader
 
-    def create_shader_program(self):
-        vertex_shader = self.compile_shader(self.load_shader_source("pbr_preview.vert"), GL_VERTEX_SHADER)
-        fragment_shader = self.compile_shader(self.load_shader_source("pbr_preview.frag"), GL_FRAGMENT_SHADER)
-        self.shader_program = glCreateProgram()
-        glAttachShader(self.shader_program, vertex_shader)
-        glAttachShader(self.shader_program, fragment_shader)
-        glLinkProgram(self.shader_program)
-        if glGetProgramiv(self.shader_program, GL_LINK_STATUS) != GL_TRUE:
-            raise RuntimeError(glGetProgramInfoLog(self.shader_program).decode())
+    def create_shader_program(self, vertex_name, fragment_name):
+        vertex_shader = self.compile_shader(self.load_shader_source(vertex_name), GL_VERTEX_SHADER)
+        fragment_shader = self.compile_shader(self.load_shader_source(fragment_name), GL_FRAGMENT_SHADER)
+        shader_program = glCreateProgram()
+        glAttachShader(shader_program, vertex_shader)
+        glAttachShader(shader_program, fragment_shader)
+        glLinkProgram(shader_program)
+        if glGetProgramiv(shader_program, GL_LINK_STATUS) != GL_TRUE:
+            raise RuntimeError(glGetProgramInfoLog(shader_program).decode())
         glDeleteShader(vertex_shader)
         glDeleteShader(fragment_shader)
+        return shader_program
+
+    def create_shader_programs(self):
+        self.shader_program = self.create_shader_program("pbr_preview.vert", "pbr_preview.frag")
+        self.compose_shader_program = self.create_shader_program("compose.vert", "compose.frag")
+        self.compose_vao = glGenVertexArrays(1)
 
     # ---- anisotropy support ----------------------------------------------------------
     def check_anisotropy_support(self):
         try:
-            extensions = glGetString(GL_EXTENSIONS)
-            if extensions:
-                ext_string = extensions.decode() if isinstance(extensions, bytes) else extensions
-                if 'GL_EXT_texture_filter_anisotropic' in ext_string:
-                    self.has_anisotropy = True
-                    self.max_anisotropy = glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT)
-                else:
-                    self.has_anisotropy = False
+            num_extensions = glGetIntegerv(GL_NUM_EXTENSIONS)
+            extensions = {
+                glGetStringi(GL_EXTENSIONS, index).decode("utf-8")
+                for index in range(num_extensions)
+            }
+            self.has_anisotropy = 'GL_EXT_texture_filter_anisotropic' in extensions
+            if self.has_anisotropy:
+                self.max_anisotropy = glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT)
             else:
-                self.has_anisotropy = False
+                self.max_anisotropy = 1.0
         except Exception:
             self.has_anisotropy = False
             self.max_anisotropy = 1.0
@@ -392,89 +298,7 @@ class PBRRendererWidget(QOpenGLWidget):
     def create_default_texture(self, color):
         return np.array([[color]], dtype=np.uint8)
 
-    def apply_normal_y_inversion(self, normal):
-        if not self.invert_normal_y:
-            return normal
-        inverted = normal.copy()
-        inverted[..., 1] = 255 - inverted[..., 1]
-        return inverted
-
-    def refresh_preview_textures(self):
-        if self.preview_mode == "packed" and self.packed_base_alpha_data is not None and self.packed_nms_data is not None:
-            self.upload_texture_set(self.packed_base_alpha_data, self.packed_nms_data)
-            return
-        self.upload_texture_set(*self.compose_live_texture_set())
-
-    def compose_live_texture_set(self):
-        base_color = self.input_textures["BaseColor"]
-        if base_color is None:
-            base_color = self.create_default_texture([255, 255, 255, 255])
-        ao = self.input_textures["AO"]
-        if ao is None:
-            ao = self.create_default_texture([255, 255, 255, 255])
-        metallic = self.input_textures["Metallic"]
-        if metallic is None:
-            metallic = self.create_default_texture([0, 0, 0, 255])
-        smoothness = self.input_textures["Smoothness"]
-        if smoothness is None:
-            smoothness = self.create_default_texture([127, 127, 127, 255])
-        normal = self.input_textures["Normal"]
-        if normal is None:
-            normal = self.create_default_texture([127, 127, 255, 255])
-        alpha = self.input_textures["Alpha"]
-        if alpha is None:
-            alpha = self.create_default_texture([255, 255, 255, 255])
-
-        max_h = max(tex.shape[0] for tex in [base_color, ao, metallic, smoothness, normal, alpha])
-        max_w = max(tex.shape[1] for tex in [base_color, ao, metallic, smoothness, normal, alpha])
-
-        def resize_texture(texture, width, height):
-            if texture.shape[0] != height or texture.shape[1] != width:
-                image = Image.fromarray(texture)
-                image = image.resize((width, height), Image.Resampling.BILINEAR)
-                return np.array(image, dtype=np.float32)
-            return texture.astype(np.float32)
-
-        base_color = resize_texture(base_color, max_w, max_h)
-        ao = resize_texture(ao, max_w, max_h)
-        metallic = resize_texture(metallic, max_w, max_h)
-        smoothness = resize_texture(smoothness, max_w, max_h)
-        normal = resize_texture(normal, max_w, max_h)
-        alpha = resize_texture(alpha, max_w, max_h)
-        normal = self.apply_normal_y_inversion(normal)
-
-        #ao_channel = np.clip((ao[..., 0] / 255.0) ** max(self.ao_intensity, 0.00001), 0.0, 1.0)
-        
-        ao_lut = (np.arange(256, dtype=np.float32) / 255.0) ** max(self.ao_intensity, 0.00001)
-        ao_channel = ao_lut[ao[..., 0].astype(np.uint8)]
-        #ao_channel = ao_lut[ao[..., 0]]   # fast integer indexing
-
-        base_ao_rgb = base_color[..., :3] * ao_channel[..., np.newaxis]
-        transparency = alpha[..., 0] if self.input_textures["Alpha"] is not None else base_color[..., 3]
-
-        base_ao_data = np.zeros((max_h, max_w, 4), dtype=np.uint8)
-        base_ao_data[..., :3] = np.clip(base_ao_rgb, 0, 255).astype(np.uint8)
-        base_ao_data[..., 3] = np.clip(transparency, 0, 255).astype(np.uint8)
-
-        nms_data = np.zeros((max_h, max_w, 4), dtype=np.uint8)
-        nms_data[..., 0] = normal[..., 0]
-        nms_data[..., 1] = normal[..., 1]
-        nms_data[..., 2] = metallic[..., 0]
-        nms_data[..., 3] = smoothness[..., 0]
-        return base_ao_data, nms_data
-
-    def upload_texture_set(self, base_ao_data, nms_data):
-        # No makeCurrent() here – called from paintGL context
-        if self.base_alpha_tex is not None:
-            glDeleteTextures([self.base_alpha_tex])
-        if self.nms_tex is not None:
-            glDeleteTextures([self.nms_tex])
-        self.base_alpha_tex = self.create_gl_texture(base_ao_data)
-        self.nms_tex = self.create_gl_texture(nms_data)
-        self.textures_loaded = True
-        self.update()
-
-    def create_gl_texture(self, data):
+    def create_gl_texture(self, data, generate_mipmaps=True):
         texture_id = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D, texture_id)
         image_data = np.flipud(data)
@@ -484,7 +308,8 @@ class PBRRendererWidget(QOpenGLWidget):
             except Exception:
                 pass
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+        min_filter = GL_LINEAR_MIPMAP_LINEAR if generate_mipmaps else GL_LINEAR
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_filter)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
@@ -499,25 +324,176 @@ class PBRRendererWidget(QOpenGLWidget):
             GL_UNSIGNED_BYTE,
             image_data,
         )
-        glGenerateMipmap(GL_TEXTURE_2D)
+        if generate_mipmaps:
+            glGenerateMipmap(GL_TEXTURE_2D)
         glBindTexture(GL_TEXTURE_2D, 0)
         return texture_id
 
+    def create_empty_gl_texture(self, width, height):
+        texture_id = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, texture_id)
+        if self.has_anisotropy:
+            try:
+                glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, self.max_anisotropy)
+            except Exception:
+                pass
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        return texture_id
+
+    def get_or_create_default_gl_texture(self, name, color):
+        texture_id = self.default_texture_cache.get(name)
+        if texture_id is None:
+            texture_id = self.create_gl_texture(self.create_default_texture(color), generate_mipmaps=True)
+            self.default_texture_cache[name] = texture_id
+        return texture_id
+
+    def delete_texture(self, texture_id):
+        if texture_id is not None:
+            glDeleteTextures([texture_id])
+
+    def sync_source_textures(self):
+        defaults = {
+            "BaseColor": [255, 255, 255, 255],
+            "AO": [255, 255, 255, 255],
+            "Metallic": [0, 0, 0, 255],
+            "Smoothness": [127, 127, 127, 255],
+            "Normal": [127, 127, 255, 255],
+            "Alpha": [255, 255, 255, 255],
+        }
+
+        max_h = 1
+        max_w = 1
+        for texture_data in self.input_textures.values():
+            if texture_data is not None:
+                max_h = max(max_h, texture_data.shape[0])
+                max_w = max(max_w, texture_data.shape[1])
+
+        default_textures = set(self.default_texture_cache.values())
+        for name, color in defaults.items():
+            texture_data = self.input_textures[name]
+            old_texture = self.compose_source_textures.get(name)
+            if old_texture is not None and old_texture not in default_textures:
+                self.delete_texture(old_texture)
+            if texture_data is None:
+                self.compose_source_textures[name] = self.get_or_create_default_gl_texture(name, color)
+            else:
+                self.compose_source_textures[name] = self.create_gl_texture(texture_data, generate_mipmaps=False)
+
+        self.compose_source_size = (max_w, max_h)
+
+    def ensure_compose_targets(self, width, height):
+        if self.compose_size == (width, height) and self.compose_fbo is not None and self.base_alpha_tex is not None and self.nms_tex is not None:
+            return
+
+        if self.compose_fbo is not None:
+            glDeleteFramebuffers(1, [self.compose_fbo])
+            self.compose_fbo = None
+
+        self.delete_texture(self.base_alpha_tex)
+        self.delete_texture(self.nms_tex)
+        self.base_alpha_tex = self.create_empty_gl_texture(width, height)
+        self.nms_tex = self.create_empty_gl_texture(width, height)
+
+        self.compose_fbo = glGenFramebuffers(1)
+        glBindFramebuffer(GL_FRAMEBUFFER, self.compose_fbo)
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self.base_alpha_tex, 0)
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, self.nms_tex, 0)
+        glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
+
+        status = glCheckFramebufferStatus(GL_FRAMEBUFFER)
+        glBindFramebuffer(GL_FRAMEBUFFER, 0)
+        if status != GL_FRAMEBUFFER_COMPLETE:
+            raise RuntimeError(f"Compose framebuffer incomplete: 0x{status:04X}")
+
+        self.compose_size = (width, height)
+
+    def run_compose_pass(self):
+        if self.compose_shader_program is None:
+            return
+
+        self.sync_source_textures()
+        width, height = self.compose_source_size
+        self.ensure_compose_targets(width, height)
+
+        previous_viewport = glGetIntegerv(GL_VIEWPORT)
+        previous_framebuffer = glGetIntegerv(GL_FRAMEBUFFER_BINDING)
+        glBindFramebuffer(GL_FRAMEBUFFER, self.compose_fbo)
+        glViewport(0, 0, width, height)
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_BLEND)
+        glClear(GL_COLOR_BUFFER_BIT)
+        glUseProgram(self.compose_shader_program)
+        glBindVertexArray(self.compose_vao)
+
+        for unit, name in enumerate(["BaseColor", "AO", "Metallic", "Smoothness", "Normal", "Alpha"]):
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, self.compose_source_textures[name])
+            glUniform1i(glGetUniformLocation(self.compose_shader_program, name), unit)
+
+        glUniform1f(glGetUniformLocation(self.compose_shader_program, "u_ao_intensity"), max(self.ao_intensity, 0.00001))
+        glUniform1f(glGetUniformLocation(self.compose_shader_program, "u_normal_gen_sigma"), max(self.normal_gen_sigma, 0.0001))
+        glUniform1f(glGetUniformLocation(self.compose_shader_program, "u_normal_gen_height"), self.normal_gen_height)
+        glUniform1i(glGetUniformLocation(self.compose_shader_program, "u_invert_normal_y"), int(self.invert_normal_y))
+        glUniform1i(glGetUniformLocation(self.compose_shader_program, "u_use_alpha"), int(self.input_textures["Alpha"] is not None))
+        glUniform1i(glGetUniformLocation(self.compose_shader_program, "u_generate_normal_from_luma"), int(self.input_textures["Normal"] is None))
+
+        glDrawArrays(GL_TRIANGLES, 0, 3)
+
+        for unit in range(6):
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, 0)
+
+        glBindVertexArray(0)
+        glUseProgram(0)
+
+        glBindTexture(GL_TEXTURE_2D, self.base_alpha_tex)
+        glGenerateMipmap(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, self.nms_tex)
+        glGenerateMipmap(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+        glBindFramebuffer(GL_FRAMEBUFFER, previous_framebuffer)
+        glViewport(*previous_viewport)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+
+        self.textures_loaded = True
+        self.compose_requested = False
+
     def set_ao_intensity(self, intensity):
         self.ao_intensity = intensity
-        if self.preview_mode == "input":
-            self.request_refresh()
+        self.request_refresh()
+
+    def set_normal_generation(self, sigma, height):
+        self.normal_gen_sigma = sigma
+        self.normal_gen_height = height
+        self.request_refresh()
 
     def set_normal_y_inverted(self, inverted):
         self.invert_normal_y = inverted
-        if self.preview_mode == "input":
-            self.request_refresh()
+        self.request_refresh()
 
-    def set_packed_textures(self, base_ao_data, nms_data):
-        self.packed_base_alpha_data = base_ao_data
+    def set_packed_textures(self, base_alpha_data, nms_data):
+        self.packed_base_alpha_data = base_alpha_data
         self.packed_nms_data = nms_data
         self.preview_mode = "packed"
-        self.refresh_preview_textures()
+        self.external_packed_mode = True
+        if self.compose_fbo is not None:
+            glDeleteFramebuffers(1, [self.compose_fbo])
+            self.compose_fbo = None
+        self.delete_texture(self.base_alpha_tex)
+        self.delete_texture(self.nms_tex)
+        self.base_alpha_tex = self.create_gl_texture(base_alpha_data)
+        self.nms_tex = self.create_gl_texture(nms_data)
+        self.compose_size = (base_alpha_data.shape[1], base_alpha_data.shape[0])
+        self.textures_loaded = True
+        self.update()
 
     def use_input_preview(self):
         self.preview_mode = "input"
@@ -596,6 +572,9 @@ class PBRRendererWidget(QOpenGLWidget):
         if not self.shader_program:
             return
 
+        if self.preview_mode == "input" and not self.external_packed_mode and self.compose_requested:
+            self.run_compose_pass()
+
         glUseProgram(self.shader_program)
 
         # upload matrices & lighting uniforms
@@ -659,10 +638,9 @@ class PBRRendererWidget(QOpenGLWidget):
         self.zoom = max(-15.0, min(-2.0, self.zoom))
         self.update()
 
-    def auto_rotate(self):
-        self.auto_rotate_enabled = False
+    def tick_preview(self):
         if self.auto_rotate_enabled:
             self.rotation_y += 0.5
             if self.rotation_y >= 360:
                 self.rotation_y -= 360
-            self.update()
+        self.update()
