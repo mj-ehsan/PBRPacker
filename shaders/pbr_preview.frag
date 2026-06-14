@@ -3,11 +3,16 @@
 
 #define MAX_LIGHTS 16
 
+#define PI 3.1415926535
 #define saturate(a) (clamp(a, 0.0, 1.0))
 float max3component (vec3 v) { return max(max(v.x,v.y),v.z); }
 
 uniform sampler2D base_alpha_tex;
 uniform sampler2D nms_tex;
+uniform sampler2D u_environment_map;
+uniform bool u_use_environment_map;
+
+const float u_env_mip_count = 8.0; 
 
 uniform vec3 camera_pos;
 
@@ -231,6 +236,180 @@ void applyDither(inout vec3 color, ivec2 pixelPos) {
     color += ditherValue / 255.0; // Scale to [0,1] range
 }
 
+vec2 dirToEquirectUV(vec3 dir) {
+    dir = normalize(dir);
+    float u = atan(dir.z, dir.x) / (2.0 * PI) + 0.5;
+    float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
+    return vec2(u, v);
+}
+
+vec3 sampleEnv(vec3 dir) {
+    return texture(u_environment_map, dirToEquirectUV(dir)).rgb;
+}
+
+vec3 sampleEnvLOD(vec3 dir, float lod) {
+    return textureLod(u_environment_map, dirToEquirectUV(dir), lod).rgb;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Low discrepancy sampling for diffuse integral
+////////////////////////////////////////////////////////////////////////////////
+
+float RadicalInverse_VdC(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+vec2 Hammersley(uint i, uint N) {
+    return vec2(float(i) / float(N), RadicalInverse_VdC(i));
+}
+
+vec3 tangentToWorld(vec3 v, vec3 N) {
+    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, N));
+    vec3 B = cross(N, T);
+    return T * v.x + B * v.y + N * v.z;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Diffuse irradiance integral from original env
+//
+// We integrate:
+// Lo_diff = integral[ Li * (base/pi) * Fd_Burley * (1-F) * NoL dω ]
+//
+// This is more view-dependent than classic Lambert irradiance, which is desirable
+// for a high quality preview.
+////////////////////////////////////////////////////////////////////////////////
+
+vec3 integrateDiffuseIBL(vec3 N, vec3 V, vec3 baseColor, vec3 F0, float metallic, float roughness) {
+    const uint SAMPLE_COUNT = 512u;
+
+    float NoV = saturate(dot(N, V));
+    vec3 sum = vec3(0.0);
+
+    for (uint i = 0u; i < SAMPLE_COUNT; ++i) {
+        vec2 Xi = Hammersley(i, SAMPLE_COUNT);
+
+        // cosine-weighted hemisphere sample
+        float phi = 2.0 * PI * Xi.x;
+        float cosTheta = sqrt(1.0 - Xi.y);
+        float sinTheta = sqrt(Xi.y);
+
+        vec3 Llocal = vec3(cos(phi) * sinTheta,
+                           sin(phi) * sinTheta,
+                           cosTheta);
+
+        vec3 L = normalize(tangentToWorld(Llocal, N));
+        vec3 H = normalize(V + L);
+
+        float NoL = saturate(dot(N, L));
+        float VoH = saturate(dot(V, H));
+
+        if (NoL > 0.0) {
+            vec3 Li = sampleEnv(L);
+
+            vec3 F = Fresnel_Physical(VoH, F0, metallic);
+
+            // diffuse energy conservation:
+            // diffuse should diminish as specular Fresnel rises
+            vec3 kd = (vec3(1.0) - F) * (1.0 - metallic);
+
+            float fd = Fd_Burley(NoV, NoL, VoH, roughness);
+
+            // Because cosine-weighted sampling has pdf = NoL / PI,
+            // estimator simplifies to Li * kd * baseColor * fd
+            sum += Li * kd * baseColor * fd;
+        }
+    }
+
+    return sum / float(SAMPLE_COUNT);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Specular IBL using prefiltered GGX mip chain
+//
+// Since the env is already prefiltered with GGX, we sample reflection direction
+// with roughness-derived LOD and modulate with a BRDF response term.
+//
+// For best physical plausibility without a BRDF LUT, we evaluate a local BRDF
+// response using NoV and exact/physical Fresnel, then apply multi-scatter
+// compensation.
+////////////////////////////////////////////////////////////////////////////////
+
+vec3 integrateSpecularIBL(vec3 N, vec3 V, vec3 F0, float metallic, float roughness, float alpha2) {
+    float NoV = saturate(dot(N, V));
+    if (NoV <= 0.0) return vec3(0.0);
+
+    vec3 R = reflect(-V, N);
+
+    // For GGX-prefiltered env maps, roughness -> mip level
+    float lod = roughness * max(u_env_mip_count - 1.0, 0.0);
+    vec3 prefiltered = sampleEnvLOD(R, lod);
+
+    // Fresnel at view angle
+    vec3 F = Fresnel_Physical(NoV, F0, metallic);
+
+    // Approximate integrated visibility for IBL.
+    // This is the weak point without a split-sum BRDF LUT.
+    // We use a high-quality approximation based on correlated Smith response.
+    //
+    // Sample a representative light direction around reflection to estimate G.
+    vec3 L = R;
+    vec3 H = normalize(V + L);
+
+    float NoL = saturate(dot(N, L));
+    float NoH = saturate(dot(N, H));
+    float VoH = saturate(dot(V, H));
+
+    float D = D_GGX(NoH, alpha2);
+    float G = G_SmithGGX_Correlated(NoV, NoL, alpha2);
+
+    // Local BRDF normalization heuristic for prefiltered env usage.
+    vec3 singleScatter = F * G;
+
+    // Multi-scatter compensation for rough surfaces
+    vec3 Fms = GGX_MultiScatterEnergy(F0, roughness);
+    vec3 multiScatter = (Fms - F) * 0.04 * (1.0 + roughness + D * alpha2);
+
+    return prefiltered * (singleScatter + multiScatter);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Final environment evaluation
+////////////////////////////////////////////////////////////////////////////////
+
+vec3 sampleEnvironmentMap(vec3 view_dir, Material M) {
+    if (!u_use_environment_map) return vec3(0.0);
+
+    vec3 N = normalize(M.normal);
+    vec3 V = normalize(view_dir); // surface -> camera
+
+    float metallic  = clamp(M.metallic, 0.0, 1.0);
+    float roughness = clamp(M.roughness.x, 0.001, 1.0);
+
+    // Prefer provided alpha if it is your actual microfacet alpha,
+    // otherwise derive from roughness.
+    float alpha = M.alpha > 0.0 ? M.alpha : roughness * roughness;
+    float alpha2 = alpha * alpha;
+
+    vec3 baseColor = clamp(M.base, 0.0, 1.0);
+
+    // Standard metallic workflow:
+    // - dielectrics have low F0
+    // - metals tint F0 by baseColor
+    vec3 dielectricF0 = vec3(0.04);
+    vec3 F0 = mix(dielectricF0, baseColor, metallic);
+
+    vec3 diffuse  = integrateDiffuseIBL(N, V, baseColor, F0, metallic, roughness);
+    vec3 specular = integrateSpecularIBL(N, V, F0, metallic, roughness, alpha2);
+
+    return diffuse + specular;
+}
+
 void main() {
     Material material;
     getMaterial(material);
@@ -242,6 +421,7 @@ void main() {
     for(int i = 0; i < num_lights; i++) {
         color += apply_lightPBR(lights[i], view_dir, material);
     }
+    color += sampleEnvironmentMap(view_dir, material);
 
     float exposure = 3.0;
     color *= pow(2.0, exposure);

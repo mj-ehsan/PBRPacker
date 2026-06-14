@@ -14,6 +14,14 @@ from OpenGL.GL.EXT.texture_filter_anisotropic import GL_TEXTURE_MAX_ANISOTROPY_E
 def np_to_gl_array(arr, dtype=np.float32):
     return arr.astype(dtype).flatten().tobytes()
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Path to the HDR environment map (equirectangular, e.g. .hdr or .exr)
+HDRI_PATH = os.path.join(os.path.dirname(__file__), "hdri", "small_empty_room_3_4k_processed.hdr")
+# ----------------------------------------------------------------------
+# helper to convert numpy array to ctypes for VBO upload
+def np_to_gl_array(arr, dtype=np.float32):
+    return arr.astype(dtype).flatten().tobytes()
+# ----------------------------------------------------------------------
 
 class PBRRendererWidget(QOpenGLWidget):
     def __init__(self, parent=None):
@@ -89,6 +97,9 @@ class PBRRendererWidget(QOpenGLWidget):
         self.timer.timeout.connect(self.tick_preview)
         self.auto_rotate_enabled = True
 
+        self.hdri_texture = None
+        self.hdri_loaded = False
+
     def schedule_compose_pass(self):
         if not self.pending_composition:
             return
@@ -114,9 +125,76 @@ class PBRRendererWidget(QOpenGLWidget):
         self.create_sphere_geometry()
         self.create_wireframe_sphere_geometry()
         self.create_shader_programs()
+        self.load_environment_map()
         self.compose_requested = True
         self.timer.start(16)
 
+    # ------------------------------------------------------------------
+    # HDR environment map loading
+    # ------------------------------------------------------------------
+    def load_environment_map(self):
+        """Load an equirectangular HDR image and create a floating‑point 2D texture."""
+        path = HDRI_PATH
+        if not os.path.exists(path):
+            print(f"HDRI not found: {path}")
+            self.hdri_loaded = False
+            return
+        try:
+            import imageio
+        except ImportError:
+            print("imageio not installed. Please install with: pip install imageio")
+            self.hdri_loaded = False
+            return
+
+        try:
+            # imageio reads HDR files directly into a float32 numpy array (shape H,W,3/4)
+            img = imageio.imread(path)
+        except Exception as e:
+            print(f"Failed to read HDRI: {e}")
+            self.hdri_loaded = False
+            return
+
+        # Convert to float32, ensure 3 channels (RGB), range [0,∞)
+        if img.ndim == 2:
+            img = np.stack([img]*3, axis=-1)
+        elif img.shape[2] == 4:
+            img = img[..., :3]   # discard alpha
+        img = np.ascontiguousarray(img, dtype=np.float32)
+
+        # Create the OpenGL texture (equirectangular, so wrap S repeat, T clamp)
+        self.hdri_texture = self.create_hdri_gl_texture(img)
+        self.hdri_loaded = True
+
+    def create_hdri_gl_texture(self, data):
+        """Create a 2D floating‑point texture from an equirectangular HDR image."""
+        texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, texture)
+
+        # Anisotropic filtering if available
+        if self.has_anisotropy:
+            try:
+                glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, self.max_anisotropy)
+            except Exception:
+                pass
+
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        # Use linear filtering with mipmaps for smooth reflections
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+
+        # Equirectangular: horizontal wraps, vertical clamped to avoid pole artefacts
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+
+        # Upload as RGB16F (half‑float) to preserve HDR range
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F,
+                     data.shape[1], data.shape[0], 0,
+                     GL_RGB, GL_FLOAT, data)
+        glGenerateMipmap(GL_TEXTURE_2D)
+
+        glBindTexture(GL_TEXTURE_2D, 0)
+        return texture
+    
     # ---- shader loading -------------------------------------------------
     def load_shader_source(self, filename):
         shader_path = os.path.join(self.shader_dir, filename)
@@ -658,11 +736,25 @@ class PBRRendererWidget(QOpenGLWidget):
             glActiveTexture(GL_TEXTURE1)
             glBindTexture(GL_TEXTURE_2D, self.nms_tex)
             glUniform1i(glGetUniformLocation(self.shader_program, "nms_tex"), 1)
+            # Environment map (if loaded)
+            glActiveTexture(GL_TEXTURE2)
+            if self.hdri_loaded and self.hdri_texture:
+                glBindTexture(GL_TEXTURE_2D, self.hdri_texture)
+            else:
+                # Bind a dummy 1x1 default texture to avoid sampling invalid data
+                dummy = self.get_or_create_default_gl_texture("hdri_dummy", [0,0,0,255])
+                glBindTexture(GL_TEXTURE_2D, dummy)
+            glUniform1i(glGetUniformLocation(self.shader_program, "u_environment_map"), 2)
+            glUniform1i(glGetUniformLocation(self.shader_program, "u_use_environment_map"),
+                        1 if self.hdri_loaded else 0)
 
             glBindVertexArray(self.sphere_vao)
             glDrawElements(GL_TRIANGLES, self.sphere_index_count, GL_UNSIGNED_INT, None)
             glBindVertexArray(0)
 
+             # Unbind textures
+            glBindTexture(GL_TEXTURE_2D, 0)
+            glActiveTexture(GL_TEXTURE1)
             glBindTexture(GL_TEXTURE_2D, 0)
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_2D, 0)
