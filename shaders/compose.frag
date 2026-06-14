@@ -34,8 +34,8 @@ vec3 NormalFromLuma(vec2 uv) {
     float sigma_invSqr2 = 0.5 / (sigma * sigma);
     vec2 grad = vec2(0.0);
 
-    for(int xx = -3; xx < 3; xx++) {
-        for(int yy = -3; yy < 3; yy++) {
+    for(int xx = -3; xx <= 3; xx++) {
+        for(int yy = -3; yy <= 3; yy++) {
 
             vec2 offs = vec2(xx, yy);
             float sLenSqr = dot(offs, offs);
