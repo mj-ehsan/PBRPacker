@@ -228,6 +228,24 @@ void getMaterial (out Material m)
     m.roughness.z = m.roughness.y * m.roughness.y;
 }
 
+float bayerDither(ivec2 pos) {
+    int x = pos.x % 4;
+    int y = pos.y % 4;
+    int index = x + y * 4;
+    int bayer[16] = int[16](
+         0,  8,  2, 10,
+        12,  4, 14,  6,
+            3, 11,  1,  9,
+            15, 7, 13, 5
+    );
+    return float(bayer[index]) / 16.0;
+}
+
+void applyDither(inout vec3 color, ivec2 pixelPos) {
+    float ditherValue = bayerDither(pixelPos);
+    color += ditherValue / 255.0; // Scale to [0,1] range
+}
+
 void main() {
     Material material;
     getMaterial(material);
@@ -243,6 +261,6 @@ void main() {
     float exposure = 3.0;
     color *= pow(2.0, exposure);
     color = ACESFilm(color);
-    
+    applyDither(color, ivec2(gl_FragCoord.xy));
     FragColor = vec4(saturate(color), material.alpha);
 }
