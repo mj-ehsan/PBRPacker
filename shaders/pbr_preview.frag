@@ -12,7 +12,7 @@ uniform sampler2D nms_tex;
 uniform sampler2D u_environment_map;
 uniform bool u_use_environment_map;
 
-const float u_env_mip_count = 8.0; 
+const float u_env_mip_count = 0.0; 
 
 uniform vec3 camera_pos;
 
@@ -421,7 +421,7 @@ void main() {
     for(int i = 0; i < num_lights; i++) {
         color += apply_lightPBR(lights[i], view_dir, material);
     }
-    color += sampleEnvironmentMap(view_dir, material);
+    //color += sampleEnvironmentMap(view_dir, material) * .001;
 
     float exposure = 3.0;
     color *= pow(2.0, exposure);

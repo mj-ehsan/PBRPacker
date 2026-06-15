@@ -16,7 +16,7 @@ def np_to_gl_array(arr, dtype=np.float32):
 # ----------------------------------------------------------------------
 # ----------------------------------------------------------------------
 # Path to the HDR environment map (equirectangular, e.g. .hdr or .exr)
-HDRI_PATH = os.path.join(os.path.dirname(__file__), "hdri", "small_empty_room_3_4k_processed.hdr")
+HDRI_PATH = os.path.join(os.path.dirname(__file__), "hdri", "small_empty_room_3_4k.exr")
 # ----------------------------------------------------------------------
 # helper to convert numpy array to ctypes for VBO upload
 def np_to_gl_array(arr, dtype=np.float32):
@@ -635,25 +635,34 @@ class PBRRendererWidget(QOpenGLWidget):
  
     def get_composed_data(self):
         """Return (base_alpha_array, nms_array) as numpy uint8 RGBA arrays."""
-        self.makeCurrent()                                # ★ ensure context is current
+        self.makeCurrent()
         try:
             if self.preview_mode == "input" and not self.external_packed_mode:
                 self.run_compose_pass()
 
             width, height = self.compose_size
             base = np.zeros((height, width, 4), dtype=np.uint8)
-            nms = np.zeros((height, width, 4), dtype=np.uint8)
+            nms  = np.zeros((height, width, 4), dtype=np.uint8)
 
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, self.compose_fbo)
-            glReadBuffer(GL_COLOR_ATTACHMENT0)
-            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, base)
-            glReadBuffer(GL_COLOR_ATTACHMENT1)
-            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, nms)
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
+            if self.compose_fbo is not None:
+                # Use the FBO’s attachments
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, self.compose_fbo)
+                glReadBuffer(GL_COLOR_ATTACHMENT0)
+                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, base)
+                glReadBuffer(GL_COLOR_ATTACHMENT1)
+                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, nms)
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
+            else:
+                # FBO has been destroyed (packed mode) – read back the textures directly
+                glBindTexture(GL_TEXTURE_2D, self.base_alpha_tex)
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, base)
+                glBindTexture(GL_TEXTURE_2D, self.nms_tex)
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, nms)
+                glBindTexture(GL_TEXTURE_2D, 0)
 
             return np.flipud(base), np.flipud(nms)
         finally:
-            self.doneCurrent()                             # ★ release context
+            self.doneCurrent()
 
     # ---- main rendering --------------------------------------------------------
     def set_shader_uniforms(self):
