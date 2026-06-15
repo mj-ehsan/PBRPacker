@@ -4,3 +4,5 @@ PyQt5
 PyGLM
 PyOpenGL
 PyInstaller
+imagecodecs
+imageio

@@ -103,27 +103,6 @@ echo Building with PyInstaller...
 pyinstaller ^
   --noconfirm ^
   --clean ^
-  --hidden-import PyQt5.sip ^
-  --hidden-import PyQt5.QtCore ^
-  --hidden-import PyQt5.QtGui ^
-  --hidden-import PyQt5.QtWidgets ^
-  --hidden-import OpenGL.platform.win32 ^
-  --hidden-import OpenGL.GL ^
-  --hidden-import OpenGL.GLU ^
-  --hidden-import OpenGL.GL.EXT.texture_filter_anisotropic ^
-  --hidden-import OpenGL.arrays.ctypesarrays ^
-  --hidden-import OpenGL.arrays.numpymodule ^
-  --hidden-import OpenGL.converters ^
-  --hidden-import OpenGL.extensions ^
-  --hidden-import ctypes ^
-  --hidden-import glm ^
-  --hidden-import numpy ^
-  --hidden-import PIL ^
-  --hidden-import PIL.Image ^
-  --hidden-import PIL.ImageFilter ^
-  --hidden-import math ^
-  --copy-metadata PyQt5 ^
-  --copy-metadata PyOpenGL ^
   PBRPacker.spec
 
 :: Deactivate venv
