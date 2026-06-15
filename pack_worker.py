@@ -1,9 +1,9 @@
 import os
+import time
 import numpy as np
-from PIL import Image
+import imagecodecs
 from PyQt5.QtCore import QThread, pyqtSignal
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 
 class PackWorker(QThread):
     """
@@ -12,16 +12,9 @@ class PackWorker(QThread):
     by pbr_renderer.py; this worker only handles file I/O.
     """
     progress = pyqtSignal(int, str)
-    # finished: success (bool), message (str),
-    #           base_alpha_array (np.uint8), nms_array (np.uint8)
     finished = pyqtSignal(bool, str, object, object)
 
     def __init__(self, base_alpha_array, nms_array, out_dir):
-        """
-        :param base_alpha_array: numpy uint8 RGBA array – BaseAOTransparency
-        :param nms_array:        numpy uint8 RGBA array – NMS (normal, metallic, smoothness)
-        :param out_dir:          directory where BaseAOTransparency.png and NMS.png are saved
-        """
         super().__init__()
         self.base_alpha_array = base_alpha_array
         self.nms_array = nms_array
@@ -34,11 +27,18 @@ class PackWorker(QThread):
 
             base_path = os.path.join(self.out_dir, "BaseAOTransparency.png")
             nms_path  = os.path.join(self.out_dir, "NMS.png")
-
+            
             def save_image(array, filepath):
-                Image.fromarray(array, "RGBA").save(
-                    filepath, optimize=True, compress_level=9
-                )
+                # Track the start time on this specific thread
+                start_time = time.perf_counter()
+                
+                # imagecodecs writes directly from the numpy buffer.
+                imagecodecs.imwrite(filepath, array, level=3)
+                
+                # Calculate elapsed time
+                elapsed_time = time.perf_counter() - start_time
+                filename = os.path.basename(filepath)
+                print(f"[Thread Log] Compression/Write for {filename} took {elapsed_time:.4f} seconds.")
 
             # Write both files in parallel
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -47,7 +47,7 @@ class PackWorker(QThread):
                     executor.submit(save_image, self.nms_array, nms_path),
                 ]
                 for future in as_completed(futures):
-                    future.result()   # raise any exception that occurred
+                    future.result()  # raise any exception that occurred
 
             self.progress.emit(100, "Done!")
             self.finished.emit(True, "Textures saved successfully.",
