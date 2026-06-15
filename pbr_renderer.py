@@ -3,6 +3,7 @@ import os
 import numpy as np
 import glm
 from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtWidgets import QOpenGLWidget
 from PyQt5.QtGui import QSurfaceFormat
@@ -43,7 +44,7 @@ class PBRRendererWidget(QOpenGLWidget):
         fmt = QSurfaceFormat()
         fmt.setSamples(8)
         fmt.setDepthBufferSize(24)
-        fmt.setVersion(3, 3)          # request OpenGL 3.3 core profile
+        fmt.setVersion(4, 5)          # request OpenGL 3.3 core profile
         fmt.setProfile(QSurfaceFormat.CoreProfile)
         self.setFormat(fmt)
 
@@ -96,21 +97,36 @@ class PBRRendererWidget(QOpenGLWidget):
         self.timer = QTimer()
         self.timer.timeout.connect(self.tick_preview)
         self.auto_rotate_enabled = True
+        self.needs_redraw = True
 
         self.hdri_texture = None
         self.hdri_loaded = False
+
+        self.readback_timer = QTimer()
+        self.readback_timer.setSingleShot(True)
+        self.readback_timer.timeout.connect(self.perform_async_readback)
+
+        self._cached_base_alpha = None
+        self._cached_nms = None
+        self.cache_dirty = True  
+        self.max_preview_res = 2048       
 
     def schedule_compose_pass(self):
         if not self.pending_composition:
             return
         self.pending_composition = False
         self.compose_requested = True
+        self.needs_redraw = True
         self.update()
 
     def request_refresh(self):
         """Debounce texture changes and schedule a single compose pass."""
         self.external_packed_mode = False
         self.pending_composition = True
+        self.cache_dirty = True
+        self._cached_base_alpha = None
+        self._cached_nms = None
+        self.needs_redraw = True
         self.composition_timer.start(50)
 
     def initializeGL(self):
@@ -394,6 +410,7 @@ class PBRRendererWidget(QOpenGLWidget):
                 self.input_textures[name] = np.array(image, dtype=np.uint8)
             except Exception:
                 self.input_textures[name] = None
+                print(f"Failed to load texture {name} from {path}")
         else:
             self.input_textures[name] = None
         self.preview_mode = "input"
@@ -434,6 +451,14 @@ class PBRRendererWidget(QOpenGLWidget):
         return texture_id
 
     def create_empty_gl_texture(self, width, height):
+        # Query hard context limits dynamically
+        max_texture_size = glGetIntegerv(GL_MAX_TEXTURE_SIZE)
+        if width > max_texture_size or height > max_texture_size:
+            print(f"[Warning] Context max size is {max_texture_size}x{max_texture_size}. "
+                  f"Requested {width}x{height} is too large. Clamping for preview.")
+            width = min(width, max_texture_size)
+            height = min(height, max_texture_size)
+
         texture_id = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D, texture_id)
         if self.has_anisotropy:
@@ -446,7 +471,14 @@ class PBRRendererWidget(QOpenGLWidget):
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        
+        # Explicitly verify the driver accepts the storage signature layout
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
+        
+        err = glGetError()
+        if err != GL_NO_ERROR:
+            print(f"[Error] glTexImage2D failed with GL Error Code: {err}")
+            
         glBindTexture(GL_TEXTURE_2D, 0)
         return texture_id
 
@@ -461,7 +493,7 @@ class PBRRendererWidget(QOpenGLWidget):
         if texture_id is not None:
             glDeleteTextures([texture_id])
 
-    def sync_source_textures(self):
+    def sync_source_textures(self, force_full_resolution=False):
         defaults = {
             "BaseColor": [255, 255, 255, 255],
             "AO": [255, 255, 255, 255],
@@ -487,8 +519,22 @@ class PBRRendererWidget(QOpenGLWidget):
             if texture_data is None:
                 self.compose_source_textures[name] = self.get_or_create_default_gl_texture(name, color)
             else:
-                self.compose_source_textures[name] = self.create_gl_texture(texture_data, generate_mipmaps=False)
+                self.compose_source_textures[name] = self.create_gl_texture(texture_data, generate_mipmaps=True)
 
+        max_texture_size = glGetIntegerv(GL_MAX_TEXTURE_SIZE)
+        max_w = min(max_w, max_texture_size)
+        max_h = min(max_h, max_texture_size)
+
+        if self.preview_mode == "input" and not force_full_resolution:
+            if max_w > self.max_preview_res or max_h > self.max_preview_res:
+                aspect = max_w / max_h
+                if max_w > max_h:
+                    max_w = self.max_preview_res
+                    max_h = int(self.max_preview_res / aspect)
+                else:
+                    max_h = self.max_preview_res
+                    max_w = int(self.max_preview_res * aspect)
+        
         self.compose_source_size = (max_w, max_h)
 
     def ensure_compose_targets(self, width, height):
@@ -517,12 +563,12 @@ class PBRRendererWidget(QOpenGLWidget):
 
         self.compose_size = (width, height)
 
-    def run_compose_pass(self):
+    def run_compose_pass(self, force_full_resolution=False):
         """Execute the compose shader to populate base_alpha_tex and nms_tex."""
         if self.compose_shader_program is None:
             return
 
-        self.sync_source_textures()
+        self.sync_source_textures(force_full_resolution=force_full_resolution)
         width, height = self.compose_source_size
         self.ensure_compose_targets(width, height)
 
@@ -572,6 +618,45 @@ class PBRRendererWidget(QOpenGLWidget):
         self.textures_loaded = True
         self.compose_requested = False
 
+        # Mark cache as dirty and schedule an async readback
+        self.cache_dirty = True
+        #self.readback_timer.start(300)    # 300 ms delay after last compose
+
+        self.textures_loaded = True
+        self.compose_requested = False
+
+    def perform_async_readback(self):
+        """Read back the compose outputs to CPU memory in the background."""
+        if not self.compose_fbo and not self.base_alpha_tex:
+            return
+
+        self.makeCurrent()
+        try:
+            width, height = self.compose_size
+            base = np.zeros((height, width, 4), dtype=np.uint8)
+            nms  = np.zeros((height, width, 4), dtype=np.uint8)
+
+            if self.compose_fbo is not None:
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, self.compose_fbo)
+                glReadBuffer(GL_COLOR_ATTACHMENT0)
+                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, base)
+                glReadBuffer(GL_COLOR_ATTACHMENT1)
+                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, nms)
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
+            else:
+                # Packed mode: textures are stored directly
+                glBindTexture(GL_TEXTURE_2D, self.base_alpha_tex)
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, base)
+                glBindTexture(GL_TEXTURE_2D, self.nms_tex)
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, nms)
+                glBindTexture(GL_TEXTURE_2D, 0)
+
+            self._cached_base_alpha = np.flipud(base)
+            self._cached_nms = np.flipud(nms)
+            self.cache_dirty = False
+        finally:
+            self.doneCurrent()
+            
     # ---- public methods for parameter changes ---------------------------------
     def set_ao_intensity(self, intensity):
         self.ao_intensity = intensity
@@ -601,6 +686,10 @@ class PBRRendererWidget(QOpenGLWidget):
         self.nms_tex = self.create_gl_texture(nms_data)
         self.compose_size = (base_alpha_data.shape[1], base_alpha_data.shape[0])
         self.textures_loaded = True
+        self.cache_dirty = True
+        self._cached_base_alpha = None
+        self._cached_nms = None
+        self.needs_redraw = True
         self.update()
 
     def use_input_preview(self):
@@ -634,31 +723,32 @@ class PBRRendererWidget(QOpenGLWidget):
         return np.flipud(pixels)
  
     def get_composed_data(self):
-        """Return (base_alpha_array, nms_array) as numpy uint8 RGBA arrays."""
+        """Bypasses proxy preview size to compile and extract full-resolution maps."""
         self.makeCurrent()
         try:
-            if self.preview_mode == "input" and not self.external_packed_mode:
-                self.run_compose_pass()
+            max_h = 1
+            max_w = 1
+            for texture_data in self.input_textures.values():
+                if texture_data is not None:
+                    max_h = max(max_h, texture_data.shape[0])
+                    max_w = max(max_w, texture_data.shape[1])
+
+            print(f"[Export] Baking final maps at full resolution: {max_w}x{max_h}...")
+
+            self.run_compose_pass(force_full_resolution=True)
 
             width, height = self.compose_size
             base = np.zeros((height, width, 4), dtype=np.uint8)
             nms  = np.zeros((height, width, 4), dtype=np.uint8)
 
-            if self.compose_fbo is not None:
-                # Use the FBO’s attachments
-                glBindFramebuffer(GL_READ_FRAMEBUFFER, self.compose_fbo)
-                glReadBuffer(GL_COLOR_ATTACHMENT0)
-                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, base)
-                glReadBuffer(GL_COLOR_ATTACHMENT1)
-                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, nms)
-                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
-            else:
-                # FBO has been destroyed (packed mode) – read back the textures directly
-                glBindTexture(GL_TEXTURE_2D, self.base_alpha_tex)
-                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, base)
-                glBindTexture(GL_TEXTURE_2D, self.nms_tex)
-                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, nms)
-                glBindTexture(GL_TEXTURE_2D, 0)
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, self.compose_fbo)
+            glReadBuffer(GL_COLOR_ATTACHMENT0)
+            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, base)
+            glReadBuffer(GL_COLOR_ATTACHMENT1)
+            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, nms)
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
+
+            self.request_refresh()
 
             return np.flipud(base), np.flipud(nms)
         finally:
@@ -728,6 +818,7 @@ class PBRRendererWidget(QOpenGLWidget):
 
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        self.needs_redraw = False
 
         if not self.shader_program:
             return
@@ -792,7 +883,7 @@ class PBRRendererWidget(QOpenGLWidget):
         if event.buttons() & Qt.LeftButton:
             self.rotation_y += dx * 0.5
             self.rotation_x -= dy * 0.5
-            self.update()
+            self.needs_redraw = True
         self.last_pos = event.pos()
 
     def mouseReleaseEvent(self, event):
@@ -801,11 +892,14 @@ class PBRRendererWidget(QOpenGLWidget):
     def wheelEvent(self, event):
         self.zoom += event.angleDelta().y() / 120.0
         self.zoom = max(-15.0, min(-2.0, self.zoom))
-        self.update()
+        self.needs_redraw = True
 
     def tick_preview(self):
         if self.auto_rotate_enabled:
             self.rotation_y += 0.5
             if self.rotation_y >= 360:
                 self.rotation_y -= 360
-        self.update()
+            self.needs_redraw = True
+
+        if self.needs_redraw or self.compose_requested:
+            self.update()

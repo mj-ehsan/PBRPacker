@@ -9,7 +9,7 @@ from pbr_gui import MainWindow
 
 if __name__ == "__main__":
     fmt = QSurfaceFormat()
-    fmt.setVersion(3, 3)
+    fmt.setVersion(4, 5)
     fmt.setProfile(QSurfaceFormat.CoreProfile)
     fmt.setSwapBehavior(QSurfaceFormat.DoubleBuffer)
     fmt.setDepthBufferSize(24)
