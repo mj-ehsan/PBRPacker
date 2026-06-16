@@ -14,6 +14,7 @@ out vec3 v_normal;
 out vec3 v_world_pos;
 out vec2 v_uv;
 out vec3 v_tangent;
+out vec3 v_bitangent;
 
 void main() {
     // Calculate world position (model matrix only, not view)
@@ -23,6 +24,7 @@ void main() {
     // Transform normal and tangent to world space (rotation only)
     v_normal = normalize(u_normal_matrix * a_normal);
     v_tangent = normalize(u_normal_matrix * a_tangent);
+    v_bitangent = normalize(cross(v_tangent, v_normal));
     
     // Pass UV coordinates
     v_uv = a_uv;
