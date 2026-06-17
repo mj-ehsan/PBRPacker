@@ -1,5 +1,4 @@
 import os
-
 import numpy as np
 from PyQt5.QtCore import pyqtSignal, QRect, QRectF, Qt, QUrl
 from PyQt5.QtGui import (
@@ -16,6 +15,8 @@ from PyQt5.QtGui import (
 )
 from PyQt5.QtWidgets import (
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -32,6 +33,96 @@ from PyQt5.QtWidgets import (
 
 from pbr_renderer import PBRRendererWidget
 
+# -------------------------------------------------------------------
+# Helper: common suffixes per map type (case‑insensitive matching)
+# -------------------------------------------------------------------
+MAP_SUFFIXES = {
+    "BaseColor": [
+        "_BaseColor", "_Albedo", "_Diffuse", "_Color", "_D", "_col",
+        "_basecolor", "_albedo", "_diffuse", "_color", "_diff",
+    ],
+    "AO": [
+        "_AO", "_AmbientOcclusion", "_Occlusion",
+        "_ao", "_ambientocclusion", "_occlusion",
+    ],
+    "Metallic": [
+        "_Metallic", "_Metalness", "_Metal",
+        "_metallic", "_metalness", "_metal",
+    ],
+    "Smoothness": [
+        "_Smoothness", "_Roughness", "_Smooth", "_Rough", "_rgh",
+        "_smoothness", "_roughness", "_smooth", "_rough",
+    ],
+    "Normal": [
+        "_Normal", "_NRM", "_N",
+        "_normal", "_nrm", "_n",
+    ],
+    "Alpha": [
+        "_Alpha", "_Opacity", "_Mask",
+        "_alpha", "_opacity", "_mask",
+    ],
+}
+
+# -------------------------------------------------------------------
+# Auto‑assignment dialog (styled consistently with the main UI)
+# -------------------------------------------------------------------
+class AutoAssignDialog(QDialog):
+    def __init__(self, base_name, candidates, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Auto‑assign Texture Maps")
+        self.setMinimumWidth(400)
+        self.candidates = candidates  # dict: map_type -> file_path
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            f"<b>Base name:</b> {base_name}<br>"
+            f"Found {len(candidates)} additional map(s) in the same folder.<br>"
+            "Choose the ones you want to assign:"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.checkboxes = {}
+        for map_type, file_path in candidates.items():
+            cb = QCheckBox(f"{map_type}: {os.path.basename(file_path)}")
+            cb.setChecked(True)
+            self.checkboxes[map_type] = cb
+            layout.addWidget(cb)
+
+        # Select / deselect all
+        toggle_layout = QHBoxLayout()
+        self.select_all_cb = QCheckBox("Select all")
+        self.select_all_cb.setChecked(True)
+        self.select_all_cb.toggled.connect(self._toggle_all)
+        toggle_layout.addWidget(self.select_all_cb)
+        toggle_layout.addStretch()
+        layout.addLayout(toggle_layout)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        # Inherit theme from main window
+        if parent:
+            self.setStyleSheet(parent.styleSheet())
+
+    def _toggle_all(self, checked):
+        for cb in self.checkboxes.values():
+            cb.setChecked(checked)
+
+    def selected_maps(self):
+        """Return dict of {map_type: path} for checked items."""
+        return {
+            mt: path for mt, path in self.candidates.items()
+            if self.checkboxes[mt].isChecked()
+        }
+
+
+# -------------------------------------------------------------------
+# ImagePreviewWidget (unchanged)
+# -------------------------------------------------------------------
 class ImagePreviewWidget(QWidget):
     fileDropped = pyqtSignal(str, str)
     cleared = pyqtSignal(str)
@@ -69,7 +160,10 @@ class ImagePreviewWidget(QWidget):
                 self.set_image(None)
                 self.cleared.emit(self.map_type)
                 return
-            path, _ = QFileDialog.getOpenFileName(self, f"Select {self.map_type} Map", "", "Images (*.png *.jpg *.jpeg *.tga *.tif)")
+            path, _ = QFileDialog.getOpenFileName(
+                self, f"Select {self.map_type} Map", "",
+                "Images (*.png *.jpg *.jpeg *.tga *.tif)"
+            )
             if path:
                 self.set_image(path)
                 self.fileDropped.emit(self.map_type, path)
@@ -84,14 +178,18 @@ class ImagePreviewWidget(QWidget):
         painter.fillPath(rounded_path, QColor("#2a2a30"))
         if self.pixmap and not self.pixmap.isNull():
             painter.setClipPath(rounded_path)
-            scaled_pix = self.pixmap.scaled(rect.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            scaled_pix = self.pixmap.scaled(
+                rect.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+            )
             x = (rect.width() - scaled_pix.width()) // 2
             y = (rect.height() - scaled_pix.height()) // 2
             painter.drawPixmap(x, y, scaled_pix)
             gradient = QRadialGradient(rect.width() / 2, rect.height(), rect.width())
             gradient.setColorAt(0, QColor(0, 0, 0, 180))
             gradient.setColorAt(1, QColor(0, 0, 0, 0))
-            painter.fillRect(rect.x(), rect.height() - 40, rect.width(), 40, QBrush(gradient))
+            painter.fillRect(
+                rect.x(), rect.height() - 40, rect.width(), 40, QBrush(gradient)
+            )
             painter.setClipping(False)
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(24, 24, 28, 215))
@@ -123,6 +221,9 @@ class ImagePreviewWidget(QWidget):
         painter.end()
 
 
+# -------------------------------------------------------------------
+# MainWindow (updated with auto‑assignment logic)
+# -------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self, worker_class):
         super().__init__()
@@ -151,9 +252,14 @@ class MainWindow(QMainWindow):
             "Alpha": None,
         }
         self.out_dir = None
+        # Flag to prevent recursive auto‑assign while we programmatically set maps
+        self._suppress_auto_assign = False
         self.init_ui()
         self.apply_theme()
 
+    # ---------------------------------------------------------------
+    # UI setup (unchanged except for keeping the original structure)
+    # ---------------------------------------------------------------
     def init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -173,7 +279,9 @@ class MainWindow(QMainWindow):
         grid = QGridLayout()
         grid.setSpacing(10)
         self.previews = {}
-        for index, map_name in enumerate(["BaseColor", "AO", "Metallic", "Smoothness", "Normal", "Alpha"]):
+        for index, map_name in enumerate(
+            ["BaseColor", "AO", "Metallic", "Smoothness", "Normal", "Alpha"]
+        ):
             preview = ImagePreviewWidget(map_name)
             preview.fileDropped.connect(self.update_texture)
             preview.cleared.connect(self.clear_texture)
@@ -284,16 +392,77 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter)
         self.installEventFilters(self)
 
+    # ---------------------------------------------------------------
+    # Texture management & auto‑assignment
+    # ---------------------------------------------------------------
     def update_texture(self, map_type, path):
+        """Called when a texture is dropped or selected manually."""
         self.paths[map_type] = path
         self.pbr_renderer.load_input_texture(map_type, path)
         self.preview_mode_label.setText("Previewing live input textures")
+
+        # Only trigger auto‑assignment if we are not already inside one
+        if not self._suppress_auto_assign:
+            self.attempt_auto_assign(map_type, path)
 
     def clear_texture(self, map_type):
         self.paths[map_type] = None
         self.pbr_renderer.load_input_texture(map_type, None)
         self.preview_mode_label.setText("Previewing live input textures")
 
+    def attempt_auto_assign(self, dropped_map_type, dropped_path):
+        """
+        Extract base name from the dropped file, look for missing maps
+        in the same directory using known suffixes, and show a dialog
+        to let the user confirm which ones to assign.
+        """
+        # Nothing to do if all maps are already filled
+        missing = [t for t in self.paths if t != dropped_map_type and self.paths[t] is None]
+        if not missing:
+            return
+
+        dir_path, filename = os.path.split(dropped_path)
+        base, ext = os.path.splitext(filename)
+
+        # Find which suffix (if any) was used for the dropped map type
+        stripped_base = base
+        suffixes_for_type = sorted(
+            MAP_SUFFIXES.get(dropped_map_type, []), key=len, reverse=True
+        )
+        for suffix in suffixes_for_type:
+            if base.lower().endswith(suffix.lower()):
+                stripped_base = base[: -len(suffix)]
+                break
+
+        # Scan for candidate files for each missing map type
+        candidates = {}
+        for mtype in missing:
+            for suffix in MAP_SUFFIXES.get(mtype, []):
+                candidate_name = stripped_base + suffix + ext
+                candidate_path = os.path.join(dir_path, candidate_name)
+                if os.path.isfile(candidate_path):
+                    candidates[mtype] = candidate_path
+                    break  # first match wins
+
+        if not candidates:
+            return
+
+        # Show dialog and apply selected maps if accepted
+        dlg = AutoAssignDialog(stripped_base, candidates, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            selected = dlg.selected_maps()
+            if selected:
+                self._suppress_auto_assign = True
+                for mtype, fpath in selected.items():
+                    self.previews[mtype].set_image(fpath)
+                    self.paths[mtype] = fpath
+                    self.pbr_renderer.load_input_texture(mtype, fpath)
+                self._suppress_auto_assign = False
+                self.preview_mode_label.setText("Previewing live input textures")
+
+    # ---------------------------------------------------------------
+    # Other UI handlers (unchanged)
+    # ---------------------------------------------------------------
     def update_normal_invert(self, checked):
         self.invert_normal_y = checked
         self.pbr_renderer.set_normal_y_inverted(checked)
@@ -366,6 +535,9 @@ class MainWindow(QMainWindow):
                 color: #e0e0e0;
                 font-family: "Segoe UI", sans-serif;
             }
+            QDialog {
+                background-color: #1e1e22;
+            }                          
             QPushButton {
                 background-color: #3a3a45;
                 border: 1px solid #5a5a65;
@@ -441,13 +613,10 @@ class MainWindow(QMainWindow):
             if not self.out_dir:
                 return
 
-        # Retrieve the final composed textures from the GPU
         base_alpha, nms = self.pbr_renderer.get_composed_data()
-
         self.btn_pack.setEnabled(False)
         self.progress_bar.show()
 
-        # New worker expects (base_alpha_array, nms_array, out_dir)
         self.worker = self.worker_class(base_alpha, nms, self.out_dir)
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.packing_finished)
