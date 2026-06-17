@@ -227,6 +227,7 @@ class ImagePreviewWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, worker_class):
         super().__init__()
+        self.batch_dir = None
         self.worker_class = worker_class
         self.setWindowTitle("PBR Texture Packer for Unity")
         self.resize(1400, 800)
@@ -335,7 +336,7 @@ class MainWindow(QMainWindow):
         material_group.setLayout(material_layout)
         left_layout.addWidget(material_group)
 
-        out_group = QGroupBox("Output Settings")
+        out_group = QGroupBox("Directories")
         out_layout = QVBoxLayout()
         out_dir_layout = QHBoxLayout()
         self.btn_out = QPushButton("Select Output Directory")
