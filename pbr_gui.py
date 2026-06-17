@@ -1,8 +1,7 @@
 import os
-from datetime import datetime
 
 import numpy as np
-from PyQt5.QtCore import pyqtSignal, QRect, QRectF, QSettings, Qt, QUrl
+from PyQt5.QtCore import pyqtSignal, QRect, QRectF, Qt, QUrl
 from PyQt5.QtGui import (
     QBrush,
     QColor,
@@ -16,22 +15,17 @@ from PyQt5.QtGui import (
     QRadialGradient,
 )
 from PyQt5.QtWidgets import (
-    QApplication,
     QCheckBox,
-    QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QProgressBar,
     QPushButton,
     QSlider,
     QSplitter,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -130,51 +124,6 @@ class ImagePreviewWidget(QWidget):
 
 
 class MainWindow(QMainWindow):
-    MAP_TYPES = ["BaseColor", "AO", "Metallic", "Smoothness", "Normal", "Alpha"]
-    MAP_ALIASES = {
-        "BaseColor": (
-            ("basecolor",),
-            ("base", "color"),
-            ("albedo",),
-            ("diffuse",),
-            ("basecol",),
-        ),
-        "AO": (
-            ("ambientocclusion",),
-            ("ambient", "occlusion"),
-            ("occlusion",),
-            ("ao",),
-        ),
-        "Metallic": (
-            ("metallic",),
-            ("metalness",),
-            ("metal",),
-            ("mtl",),
-        ),
-        "Smoothness": (
-            ("smoothness",),
-            ("smooth",),
-            ("roughness",),
-            ("rough",),
-            ("glossiness",),
-            ("gloss",),
-            ("rgh",),
-        ),
-        "Normal": (
-            ("normalgl",),
-            ("normaldx",),
-            ("normal",),
-            ("nrm",),
-            ("nor",),
-        ),
-        "Alpha": (
-            ("alpha",),
-            ("opacity",),
-            ("transparency",),
-            ("trans",),
-        ),
-    }
-
     def __init__(self, worker_class):
         super().__init__()
         self.worker_class = worker_class
@@ -201,15 +150,7 @@ class MainWindow(QMainWindow):
             "Normal": None,
             "Alpha": None,
         }
-        self.settings = QSettings()
-        self.auto_assign_prompt_enabled = self.settings.value("auto_assign_prompt_enabled", True, type=bool)
-        self.batch_input_dir = None
-        self.batch_options = {
-            "ignore_missing_basecolor": False,
-            "ignore_ao": False,
-        }
         self.out_dir = None
-        self.max_compression_workers = max((os.cpu_count() or 2) - 1, 1)
         self.init_ui()
         self.apply_theme()
 
@@ -232,7 +173,7 @@ class MainWindow(QMainWindow):
         grid = QGridLayout()
         grid.setSpacing(10)
         self.previews = {}
-        for index, map_name in enumerate(self.MAP_TYPES):
+        for index, map_name in enumerate(["BaseColor", "AO", "Metallic", "Smoothness", "Normal", "Alpha"]):
             preview = ImagePreviewWidget(map_name)
             preview.fileDropped.connect(self.update_texture)
             preview.cleared.connect(self.clear_texture)
@@ -286,17 +227,8 @@ class MainWindow(QMainWindow):
         material_group.setLayout(material_layout)
         left_layout.addWidget(material_group)
 
-        out_group = QGroupBox("Directory Settings")
+        out_group = QGroupBox("Output Settings")
         out_layout = QVBoxLayout()
-        batch_dir_layout = QHBoxLayout()
-        self.btn_batch_in = QPushButton("Batch Processing Folder Input")
-        self.btn_batch_in.clicked.connect(self.select_batch_input)
-        self.txt_batch_in = QLineEdit()
-        self.txt_batch_in.setReadOnly(True)
-        self.txt_batch_in.setPlaceholderText("No directory selected")
-        batch_dir_layout.addWidget(self.btn_batch_in)
-        batch_dir_layout.addWidget(self.txt_batch_in, 1)
-        out_layout.addLayout(batch_dir_layout)
         out_dir_layout = QHBoxLayout()
         self.btn_out = QPushButton("Select Output Directory")
         self.btn_out.clicked.connect(self.select_output)
@@ -341,25 +273,6 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.preview_mode_label)
         self.pbr_renderer = PBRRendererWidget()
         right_layout.addWidget(self.pbr_renderer)
-        self.log_overlay = QTextEdit(self.pbr_renderer)
-        self.log_overlay.setReadOnly(True)
-        self.log_overlay.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.log_overlay.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.log_overlay.setFixedSize(360, 140)
-        self.log_overlay.move(12, 12)
-        self.log_overlay.setStyleSheet("""
-            QTextEdit {
-                background: rgba(0, 0, 0, 0);
-                color: rgba(224, 224, 224, 220);
-                border: 1px solid rgba(90, 90, 101, 120);
-                border-radius: 6px;
-                padding: 6px;
-                font-family: Consolas, "Courier New", monospace;
-                font-size: 11px;
-            }
-        """)
-        self.log_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.log_overlay.raise_()
         reset_btn = QPushButton("Reset View")
         reset_btn.clicked.connect(self.reset_view)
         right_layout.addWidget(reset_btn)
@@ -372,176 +285,14 @@ class MainWindow(QMainWindow):
         self.installEventFilters(self)
 
     def update_texture(self, map_type, path):
-        was_empty_before = not any(existing_path for existing_path in self.paths.values())
-        self.apply_texture(map_type, path)
-        if was_empty_before and path:
-            self.maybe_auto_assign_related_textures(map_type, path)
+        self.paths[map_type] = path
+        self.pbr_renderer.load_input_texture(map_type, path)
+        self.preview_mode_label.setText("Previewing live input textures")
 
     def clear_texture(self, map_type):
         self.paths[map_type] = None
         self.pbr_renderer.load_input_texture(map_type, None)
         self.preview_mode_label.setText("Previewing live input textures")
-
-    def apply_texture(self, map_type, path):
-        self.paths[map_type] = path
-        preview = self.previews.get(map_type)
-        if preview and preview.file_path != path:
-            preview.set_image(path)
-        self.pbr_renderer.load_input_texture(map_type, path)
-        self.preview_mode_label.setText("Previewing live input textures")
-
-    def maybe_auto_assign_related_textures(self, selected_map_type, selected_path):
-        matches = self.find_related_textures(selected_map_type, selected_path)
-        if not matches:
-            return
-        if self.auto_assign_prompt_enabled:
-            allow, dont_ask_again = self.ask_auto_assign_permission(matches)
-            if dont_ask_again:
-                self.auto_assign_prompt_enabled = False
-                self.settings.setValue("auto_assign_prompt_enabled", False)
-            if not allow:
-                return
-        for map_type, path in matches.items():
-            self.apply_texture(map_type, path)
-
-    def find_related_textures(self, selected_map_type, selected_path, ignore_gui_state=False):
-        directory = os.path.dirname(selected_path)
-        filename = os.path.basename(selected_path)
-        stem, _ = os.path.splitext(filename)
-        parsed_selected = self.parse_texture_name(stem)
-        if not parsed_selected or parsed_selected["map_type"] != selected_map_type:
-            return {}
-        selected_base = parsed_selected["base_name"]
-
-        matches = {}
-        for entry in os.scandir(directory):
-            if not entry.is_file():
-                continue
-            candidate_stem, candidate_ext = os.path.splitext(entry.name)
-            if candidate_ext.lower() not in {".png", ".jpg", ".jpeg", ".tga", ".tif", ".tiff", ".bmp"}:
-                continue
-            if entry.path == selected_path:
-                continue
-            parsed_candidate = self.parse_texture_name(candidate_stem)
-            if not parsed_candidate:
-                continue
-            candidate_map = parsed_candidate["map_type"]
-            if candidate_map == selected_map_type:
-                continue
-            if parsed_candidate["base_name"] != selected_base:
-                continue
-            if not ignore_gui_state and self.paths[candidate_map]:
-                continue
-            matches[candidate_map] = entry.path
-        return matches
-
-    def build_texture_set_from_seed(self, map_type, path):
-        texture_set = {name: None for name in self.MAP_TYPES}
-        if not path:
-            return texture_set
-        texture_set[map_type] = path
-        texture_set.update(self.find_related_textures(map_type, path, ignore_gui_state=True))
-        return texture_set
-
-    def normalize_texture_name(self, stem):
-        chars = []
-        for char in stem.lower():
-            chars.append(char if char.isalnum() else " ")
-        return " ".join("".join(chars).split())
-
-    def tokenize_texture_name(self, stem):
-        normalized = self.normalize_texture_name(stem)
-        return normalized.split() if normalized else []
-
-    def parse_texture_name(self, stem):
-        tokens = self.tokenize_texture_name(stem)
-        if not tokens:
-            return None
-
-        best_match = None
-        for map_type, aliases in self.MAP_ALIASES.items():
-            for alias_tokens in aliases:
-                alias_len = len(alias_tokens)
-                if len(tokens) >= alias_len and tuple(tokens[-alias_len:]) == alias_tokens:
-                    base_tokens = tokens[:-alias_len]
-                    score = (3, alias_len)
-                elif len(tokens) >= alias_len and tuple(tokens[:alias_len]) == alias_tokens:
-                    base_tokens = tokens[alias_len:]
-                    score = (2, alias_len)
-                elif alias_len == 1 and alias_tokens[0] in tokens:
-                    alias_index = tokens.index(alias_tokens[0])
-                    base_tokens = tokens[:alias_index] + tokens[alias_index + 1:]
-                    score = (1, alias_len)
-                else:
-                    continue
-
-                if not base_tokens:
-                    continue
-                candidate = {
-                    "map_type": map_type,
-                    "base_name": " ".join(base_tokens),
-                    "score": score,
-                }
-                if best_match is None or candidate["score"] > best_match["score"]:
-                    best_match = candidate
-        return best_match
-
-    def ask_auto_assign_permission(self, matches):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Auto-assign matching textures?")
-        dialog.setModal(True)
-        dialog.setStyleSheet("""
-            QDialog {
-                background-color: #1e1e22;
-                color: #e0e0e0;
-            }
-            QLabel {
-                color: #e0e0e0;
-            }
-            QCheckBox {
-                color: #e0e0e0;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                background-color: #2a2a30;
-                border: 1px solid #4a4a55;
-                border-radius: 4px;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #4CAF50;
-                border: 1px solid #4CAF50;
-            }
-            QPushButton {
-                background-color: #3a3a45;
-                border: 1px solid #5a5a65;
-                border-radius: 6px;
-                padding: 8px 16px;
-                font-weight: bold;
-                color: #e0e0e0;
-            }
-            QPushButton:hover {
-                background-color: #4a4a55;
-                border: 1px solid #7a7a85;
-            }
-            QPushButton:pressed {
-                background-color: #2a2a35;
-            }
-        """)
-        layout = QVBoxLayout(dialog)
-        names = ", ".join(sorted(matches.keys()))
-        message = QLabel(f"Found matching textures for {names} in the same folder. Auto-assign them?")
-        message.setWordWrap(True)
-        layout.addWidget(message)
-        dont_ask_again = QCheckBox("Don't ask again")
-        layout.addWidget(dont_ask_again)
-        buttons = QDialogButtonBox(QDialogButtonBox.Yes | QDialogButtonBox.No)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        allow = dialog.exec_() == QDialog.Accepted
-        return allow, dont_ask_again.isChecked()
 
     def update_normal_invert(self, checked):
         self.invert_normal_y = checked
@@ -684,211 +435,23 @@ class MainWindow(QMainWindow):
             self.out_dir = dir_path
             self.lbl_out.setText(dir_path)
 
-    def select_batch_input(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "Select Batch Input Directory")
-        if dir_path:
-            self.batch_input_dir = dir_path
-            self.txt_batch_in.setText(dir_path)
-
     def start_packing(self):
         if not self.out_dir:
             self.select_output()
             if not self.out_dir:
                 return
-        if self.batch_input_dir:
-            self.start_batch_packing()
-            return
 
-        self.append_log("Baking current material…")
+        # Retrieve the final composed textures from the GPU
         base_alpha, nms = self.pbr_renderer.get_composed_data()
 
         self.btn_pack.setEnabled(False)
         self.progress_bar.show()
 
-        jobs = [{
-            "base_alpha": base_alpha,
-            "nms": nms,
-            "base_path": "BaseAOTransparency.png",
-            "nms_path": "NMS.png",
-        }]
-        self.worker = self.worker_class(jobs, self.out_dir, max_workers=min(self.max_compression_workers, 2))
+        # New worker expects (base_alpha_array, nms_array, out_dir)
+        self.worker = self.worker_class(base_alpha, nms, self.out_dir)
         self.worker.progress.connect(self.update_progress)
-        self.worker.log.connect(self.append_log)
         self.worker.finished.connect(self.packing_finished)
         self.worker.start()
-
-    def start_batch_packing(self):
-        if not self.batch_input_dir:
-            self.append_log("Batch input folder not set.")
-            return
-        options = self.ask_batch_processing_options()
-        if options is None:
-            return
-        self.batch_options = options
-        groups = self.collect_batch_groups(self.batch_input_dir)
-        if not groups:
-            self.append_log("No texture groups found for batch processing.")
-            return
-
-        self.btn_pack.setEnabled(False)
-        self.progress_bar.show()
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("%p% - Baking batch…")
-        jobs = []
-        total_groups = len(groups)
-        baked_count = 0
-        for index, (group_name, texture_paths) in enumerate(groups.items(), start=1):
-            expanded_paths = self.expand_batch_texture_set(texture_paths)
-            if self.batch_options["ignore_missing_basecolor"] and not expanded_paths.get("BaseColor"):
-                self.append_log(f"[Batch] Skipping {group_name} (no BaseColor)")
-                continue
-            baked_count += 1
-            self.append_log(f"[Batch] Baking {group_name} ({index}/{total_groups})")
-            self.load_texture_set(expanded_paths)
-            base_alpha, nms = self.pbr_renderer.get_composed_data()
-            safe_name = self.make_safe_output_name(group_name)
-            jobs.append({
-                "base_alpha": base_alpha,
-                "nms": nms,
-                "base_path": os.path.join(safe_name, "BaseAOTransparency.png"),
-                "nms_path": os.path.join(safe_name, "NMS.png"),
-            })
-            progress = int((index / total_groups) * 50)
-            self.update_progress(progress, f"Baked {baked_count}/{total_groups} sets…")
-            QApplication.processEvents()
-
-        if not jobs:
-            self.btn_pack.setEnabled(True)
-            self.progress_bar.setFormat("0% - No valid batch sets found")
-            self.append_log("No valid batch sets remained after filtering.")
-            return
-
-        self.worker = self.worker_class(jobs, self.out_dir, max_workers=self.max_compression_workers)
-        self.worker.progress.connect(self.update_progress)
-        self.worker.log.connect(self.append_log)
-        self.worker.finished.connect(self.packing_finished)
-        self.worker.start()
-
-    def collect_batch_groups(self, root_dir):
-        groups = {}
-        supported_exts = {".png", ".jpg", ".jpeg", ".tga", ".tif", ".tiff", ".bmp"}
-        for current_root, _, files in os.walk(root_dir):
-            for filename in files:
-                stem, ext = os.path.splitext(filename)
-                if ext.lower() not in supported_exts:
-                    continue
-                parsed_texture = self.parse_texture_name(stem)
-                if not parsed_texture:
-                    continue
-                map_type = parsed_texture["map_type"]
-                base_name = parsed_texture["base_name"]
-                rel_root = os.path.relpath(current_root, root_dir)
-                rel_root = "" if rel_root == "." else rel_root
-                group_key = os.path.join(rel_root, base_name).replace("\\", "/")
-                groups.setdefault(group_key, {})
-                groups[group_key].setdefault(map_type, os.path.join(current_root, filename))
-        return dict(sorted(groups.items()))
-
-    def load_texture_set(self, texture_paths):
-        for map_type in self.MAP_TYPES:
-            if map_type == "AO" and self.batch_options["ignore_ao"]:
-                self.apply_texture(map_type, None)
-                continue
-            path = texture_paths.get(map_type)
-            self.apply_texture(map_type, path)
-
-    def expand_batch_texture_set(self, texture_paths):
-        if texture_paths.get("BaseColor"):
-            expanded = self.build_texture_set_from_seed("BaseColor", texture_paths["BaseColor"])
-        else:
-            expanded = {name: None for name in self.MAP_TYPES}
-            for map_type in self.MAP_TYPES:
-                seed_path = texture_paths.get(map_type)
-                if seed_path:
-                    expanded = self.build_texture_set_from_seed(map_type, seed_path)
-                    break
-        for map_type, path in texture_paths.items():
-            if path and not expanded.get(map_type):
-                expanded[map_type] = path
-        return expanded
-
-    def make_safe_output_name(self, name):
-        cleaned = []
-        for char in name:
-            cleaned.append(char if char.isalnum() or char in ("-", "_", "/", os.sep) else "_")
-        return "".join(cleaned).strip("/\\") or "TextureSet"
-
-    def append_log(self, message):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_overlay.append(f"[{timestamp}] {message}")
-        scrollbar = self.log_overlay.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
-    def ask_batch_processing_options(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Batch Processing Options")
-        dialog.setModal(True)
-        dialog.setStyleSheet("""
-            QDialog {
-                background-color: #1e1e22;
-                color: #e0e0e0;
-            }
-            QLabel {
-                color: #e0e0e0;
-            }
-            QCheckBox {
-                color: #e0e0e0;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                background-color: #2a2a30;
-                border: 1px solid #4a4a55;
-                border-radius: 4px;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #4CAF50;
-                border: 1px solid #4CAF50;
-            }
-            QPushButton {
-                background-color: #3a3a45;
-                border: 1px solid #5a5a65;
-                border-radius: 6px;
-                padding: 8px 16px;
-                font-weight: bold;
-                color: #e0e0e0;
-            }
-            QPushButton:hover {
-                background-color: #4a4a55;
-                border: 1px solid #7a7a85;
-            }
-            QPushButton:pressed {
-                background-color: #2a2a35;
-            }
-        """)
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("Choose how batch processing should handle incomplete texture sets."))
-
-        ignore_missing_basecolor = QCheckBox("Ignore textures with no Base Color")
-        ignore_missing_basecolor.setChecked(self.batch_options["ignore_missing_basecolor"])
-        layout.addWidget(ignore_missing_basecolor)
-
-        ignore_ao = QCheckBox("Ignore AO")
-        ignore_ao.setChecked(self.batch_options["ignore_ao"])
-        layout.addWidget(ignore_ao)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        if dialog.exec_() != QDialog.Accepted:
-            return None
-        return {
-            "ignore_missing_basecolor": ignore_missing_basecolor.isChecked(),
-            "ignore_ao": ignore_ao.isChecked(),
-        }
 
     def update_progress(self, val, text):
         self.progress_bar.setValue(val)
@@ -898,12 +461,9 @@ class MainWindow(QMainWindow):
         self.btn_pack.setEnabled(True)
         if success:
             self.progress_bar.setFormat("100% - Finished!")
-            if base_ao_data is not None and nms_data is not None:
-                self.pbr_renderer.set_packed_textures(base_ao_data, nms_data)
-                self.preview_mode_label.setText("Previewing packed output textures")
-            self.append_log(msg)
+            self.pbr_renderer.set_packed_textures(base_ao_data, nms_data)
+            self.preview_mode_label.setText("Previewing packed output textures")
             if self.chk_open.isChecked():
                 QDesktopServices.openUrl(QUrl.fromLocalFile(self.out_dir))
         else:
             self.progress_bar.setFormat(f"Error: {msg}")
-            self.append_log(f"[Error] {msg}")

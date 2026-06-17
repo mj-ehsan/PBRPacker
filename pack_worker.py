@@ -1,6 +1,5 @@
 import os
 import time
-import traceback
 import numpy as np
 import imagecodecs
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -14,47 +13,45 @@ class PackWorker(QThread):
     """
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(bool, str, object, object)
-    log = pyqtSignal(str)
 
-    def __init__(self, jobs, out_dir, max_workers=None):
+    def __init__(self, base_alpha_array, nms_array, out_dir):
         super().__init__()
-        self.jobs = jobs
+        self.base_alpha_array = base_alpha_array
+        self.nms_array = nms_array
         self.out_dir = out_dir
-        self.max_workers = max_workers or 2
 
     def run(self):
         try:
-            self.progress.emit(5, "Saving textures…")
+            self.progress.emit(10, "Saving textures…")
             os.makedirs(self.out_dir, exist_ok=True)
-            total_files = max(len(self.jobs) * 2, 1)
-            completed_files = 0
 
+            base_path = os.path.join(self.out_dir, "BaseAOTransparency.png")
+            nms_path  = os.path.join(self.out_dir, "NMS.png")
+            
             def save_image(array, filepath):
+                # Track the start time on this specific thread
                 start_time = time.perf_counter()
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                
+                # imagecodecs writes directly from the numpy buffer.
                 imagecodecs.imwrite(filepath, array, level=3)
+                
+                # Calculate elapsed time
                 elapsed_time = time.perf_counter() - start_time
                 filename = os.path.basename(filepath)
-                self.log.emit(f"[Save] {filename} in {elapsed_time:.3f}s")
-                return filepath
+                print(f"[Thread Log] Compression/Write for {filename} took {elapsed_time:.4f} seconds.")
 
-            futures = []
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                for job in self.jobs:
-                    base_path = os.path.join(self.out_dir, job["base_path"])
-                    nms_path = os.path.join(self.out_dir, job["nms_path"])
-                    futures.append(executor.submit(save_image, job["base_alpha"], base_path))
-                    futures.append(executor.submit(save_image, job["nms"], nms_path))
+            # Write both files in parallel
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(save_image, self.base_alpha_array, base_path),
+                    executor.submit(save_image, self.nms_array, nms_path),
+                ]
                 for future in as_completed(futures):
-                    future.result()
-                    completed_files += 1
-                    progress = 5 + int((completed_files / total_files) * 95)
-                    self.progress.emit(progress, f"Saved {completed_files}/{total_files} files…")
+                    future.result()  # raise any exception that occurred
+
             self.progress.emit(100, "Done!")
-            preview_base = self.jobs[-1]["base_alpha"] if self.jobs else None
-            preview_nms = self.jobs[-1]["nms"] if self.jobs else None
-            self.finished.emit(True, "Textures saved successfully.", preview_base, preview_nms)
+            self.finished.emit(True, "Textures saved successfully.",
+                               self.base_alpha_array, self.nms_array)
 
         except Exception as error:
-            self.log.emit(traceback.format_exc().strip())
             self.finished.emit(False, str(error), None, None)
