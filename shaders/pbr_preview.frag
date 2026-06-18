@@ -1,10 +1,11 @@
-#version 330
+#version 450
 #extension GL_ARB_derivative_control : require
 
 #define MAX_LIGHTS 16
 
 #define PI 3.1415926535
 #define saturate(a) (clamp(a, 0.0, 1.0))
+#define rsqrt(a) inversesqrt(a)
 float max3component (vec3 v) { return max(max(v.x,v.y),v.z); }
 
 uniform sampler2D base_alpha_tex;
@@ -40,6 +41,18 @@ struct Material {
     float alpha;
     float metallic;
     vec3 roughness; //with pow2 and pow4
+};
+
+struct LightIndependentLightingData {
+    vec3  viewDir;
+    float noV;
+    float quarterOverNoV;
+    float viewAngleFactor;
+    float schlickWeight;
+    vec3  f0;
+    float oneMinusMetallic;
+    vec3 ggxMultiScatterEnergy;
+    float burleyViewFactor;
 };
 
 vec3 Fresnel_Schlick(float cosTheta, vec3 F0)
@@ -79,11 +92,11 @@ vec3 Fresnel_Physical(float cosTheta, vec3 F0, float metallic) {
     }
 }
 
-float Fd_Burley(float NoV, float NoL, float VoH, float roughness)
+float Fd_Burley(float vf, float NoL, float VoH, float roughness)
 {
-    float fd90 = 0.5 + 2.0 * VoH * VoH * roughness;
-    float lightScatter = 1.0 + (fd90 - 1.0) * pow(1.0 - NoL, 5.0);
-    float viewScatter  = 1.0 + (fd90 - 1.0) * pow(1.0 - NoV, 5.0);
+    float fd90 = 2.0 * VoH * VoH * roughness - 0.5;
+    float lightScatter = 1.0 + fd90 * pow(1.0 - NoL, 5.0);
+    float viewScatter  = 1.0 + fd90 * vf;
     return lightScatter * viewScatter;
 }
 
@@ -93,12 +106,12 @@ float D_GGX(float NoH, float alpha2)
     return alpha2 / (3.14159265 * d * d);
 }
 
-float G_SmithGGX_Correlated(float NoV, float NoL, float alpha2)
+float G_SmithGGX_Correlated(LightIndependentLightingData data, float NoL, float alpha2)
 {
-    float denomV = NoL * sqrt(alpha2 + (1.0 - alpha2) * NoV * NoV);
-    float denomL = NoV * sqrt(alpha2 + (1.0 - alpha2) * NoL * NoL);
+    float denomV = NoL * data.viewAngleFactor;
+    float denomL = data.noV * sqrt(alpha2 + (1.0 - alpha2) * NoL * NoL);
 
-    return (2.0 * NoL * NoV) / max(denomV + denomL, 1e-5);
+    return (2.0 * NoL * data.noV) / max(denomV + denomL, 1e-5);
 }
 
 vec3 GGX_MultiScatterEnergy(vec3 F0, float roughness)
@@ -108,37 +121,54 @@ vec3 GGX_MultiScatterEnergy(vec3 F0, float roughness)
     return F0 * energyFactor + energyBias;
 }
 
-vec3 apply_lightPBR(Light light, vec3 V, Material M) {
+void computeLightIndependentLightingData(in Material M, in vec3 V, out LightIndependentLightingData data) {
+    data.viewDir = V;
+    data.noV = saturate(dot(M.normal, data.viewDir));
+    data.quarterOverNoV = 0.25 / max(data.noV, 1e-5);
+    data.viewAngleFactor = sqrt(M.roughness.z + (1.0 - M.roughness.z) * data.noV * data.noV);
+
+    float OneMinusNoV = 1.0 - data.noV;
+    float n2 = OneMinusNoV * OneMinusNoV;
+    data.schlickWeight = n2 * n2 * OneMinusNoV;
+
+    data.f0 = mix(vec3(0.04), M.base, vec3(M.metallic));
+    data.oneMinusMetallic = 1.0 - M.metallic;
+    data.ggxMultiScatterEnergy = GGX_MultiScatterEnergy(data.f0, M.roughness.x);
+}
+
+vec3 apply_lightPBR(Light light, Material M, LightIndependentLightingData data) {
+
     vec3 Lv = light.pos - v_world_pos;
-    float Ll = length(Lv);
-    float L_atten = 1.0 / max(Ll * Ll, 0.01); //considering a light radius of 0.1 => 0.1^2 = 0.01
+
+    float Ll2 = dot(Lv,Lv);
+    float InvL = rsqrt(Ll2);
+    vec3 L = Lv * InvL;
+
+    float NoL = dot(M.normal, L);
+    if(NoL < 0.0f) return vec3(0.0);
+
+    float L_atten = 1.0 / max(Ll2, 0.01); //considering a light radius of 0.1 => 0.1^2 = 0.01
     vec3 radiance = L_atten * light.color * light.intensity;
 
-    vec3 L = Lv / Ll;
-    vec3 H = normalize(V + L);
+    vec3 H = normalize(data.viewDir + L);
     
-    float NoL = saturate(dot(M.normal, L));
-    float NoV = saturate(dot(M.normal, V));
     float NoH = saturate(dot(M.normal, H));
-	float VoH = saturate(dot(V, H));
-
-    vec3 dF0 = vec3(0.04,0.04,0.04);
-    vec3 F0 = mix(dF0, M.base, vec3(M.metallic));
+	float VoH = saturate(dot(data.viewDir, H));
     
-    vec3 F = Fresnel_Physical(VoH, F0, M.metallic);
+    vec3 F = Fresnel_Physical(VoH, data.f0, M.metallic);
 
     // ---- Diffuse (Burley, energy aware) ----
-    float Fd = Fd_Burley(NoV, NoL, VoH, M.roughness.x);
-	vec3 diffuse = (M.base / 3.14159265) * Fd * NoL * (1.0 - M.metallic);
+    float Fd = Fd_Burley(data.schlickWeight, NoL, VoH, M.roughness.x);
+	vec3 diffuse = (M.base / 3.14159265) * Fd * NoL * data.oneMinusMetallic;
 
     // ---- GGX Specular (height-correlated) ----
 	float D = D_GGX(NoH, M.roughness.z);
-	float G = G_SmithGGX_Correlated(NoV, NoL, M.roughness.z);
-	vec3 specSingle = (D * G * F) / max(4.0 * NoV, 1e-4);
+	float G = G_SmithGGX_Correlated(data, NoL, M.roughness.z);
+	vec3 specSingle = D * G * F * data.quarterOverNoV;
 
     // ---- Multiscatter compensation ----
-	vec3 Fms = GGX_MultiScatterEnergy(F0, M.roughness.x);
-	vec3 specMulti = Fms * mix(NoL * vec3(Fd,Fd,Fd), specSingle, M.metallic);
+	vec3 Fms = data.ggxMultiScatterEnergy;
+	vec3 specMulti = Fms * mix(NoL * vec3(Fd), specSingle, M.metallic);
 
     // ---- Energy balancing ----
 	vec3 specular  = mix(specSingle, specMulti, M.metallic);
@@ -263,15 +293,17 @@ void applyDither(inout vec3 color, ivec2 pixelPos) {
 const bool debug = false;
 
 void main() {
-    Material material;
-    getMaterial(material);
-    
-
     vec3 view_dir = normalize(camera_pos - v_world_pos);
+
+    Material material;
+    LightIndependentLightingData lightingData;
+
+    getMaterial(material);
+    computeLightIndependentLightingData(material, view_dir, lightingData);
 
     vec3 color = vec3(0.0, 0.0, 0.0);
     for(int i = (debug ? 2 : 0); i < (debug ? 3 : num_lights); i++) {
-        color += apply_lightPBR(lights[i], view_dir, material);
+        color += apply_lightPBR(lights[i], material, lightingData);
     }
     //apply ambient light
     color += material.base * 0.02;
