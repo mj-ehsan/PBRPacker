@@ -28,8 +28,8 @@ class BatchPackWorker(QThread):
             for idx, item in enumerate(self.items):
                 out_dir = item['output_dir']
                 os.makedirs(out_dir, exist_ok=True)
-                base_path = os.path.join(out_dir, "BaseAOTransparency.png")
-                nms_path = os.path.join(out_dir, "NMS.png")
+                base_path = os.path.join(out_dir, f"{item['base_name']}_BaseAOTransparency.png")
+                nms_path  = os.path.join(out_dir, f"{item['base_name']}_NMS.png")
                 tasks.append((item['base_alpha'], base_path, idx, "BaseAO"))
                 tasks.append((item['nms'], nms_path, idx, "NMS"))
 
