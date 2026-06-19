@@ -525,6 +525,11 @@ class MainWindow(QMainWindow):
             self.progress_bar.setFormat(f"Composing {set_info['base_name']}...")
             QApplication.processEvents()
 
+            # Clear all input textures to avoid cross‑contamination
+            for map_name in ["BaseColor", "AO", "Metallic", "Smoothness", "Normal", "Alpha"]:
+                self.pbr_renderer.load_input_texture(map_name, None)
+                self.paths = {key: None for key in self.paths}
+            
             # Load textures into the renderer
             for map_type, path in set_info['maps'].items():
                 self.paths[map_type] = path
