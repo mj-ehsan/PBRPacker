@@ -1,17 +1,20 @@
 import os
+import time   # <-- added for log timestamps
 import numpy as np
-from PyQt5.QtCore import pyqtSignal, QRect, QRectF, Qt, QUrl
+from PyQt5.QtCore import pyqtSignal, QRect, QRectF, Qt, QUrl, QTimer  # QTimer added
 from PyQt5.QtGui import (
     QBrush,
     QColor,
     QDesktopServices,
     QFont,
+    QFontMetrics,
     QImage,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
     QRadialGradient,
+    QLinearGradient,          # <-- added for gradient fade
 )
 from PyQt5.QtWidgets import (
     QApplication,
@@ -37,7 +40,7 @@ from pbr_renderer import PBRRendererWidget
 from pack_worker import BatchPackWorker
 
 # -------------------------------------------------------------------
-# Helper: common suffixes per map type (case‑insensitive matching)
+# Helper: common suffixes per map type (unchanged)
 # -------------------------------------------------------------------
 MAP_SUFFIXES = {
     "BaseColor": [
@@ -67,14 +70,14 @@ MAP_SUFFIXES = {
 }
 
 # -------------------------------------------------------------------
-# Auto‑assignment dialog (styled consistently with the main UI)
+# Auto‑assignment dialog (unchanged)
 # -------------------------------------------------------------------
 class AutoAssignDialog(QDialog):
     def __init__(self, base_name, candidates, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Auto‑assign Texture Maps")
         self.setMinimumWidth(400)
-        self.candidates = candidates  # dict: map_type -> file_path
+        self.candidates = candidates
 
         layout = QVBoxLayout(self)
 
@@ -93,7 +96,6 @@ class AutoAssignDialog(QDialog):
             self.checkboxes[map_type] = cb
             layout.addWidget(cb)
 
-        # Select / deselect all
         toggle_layout = QHBoxLayout()
         self.select_all_cb = QCheckBox("Select all")
         self.select_all_cb.setChecked(True)
@@ -107,7 +109,6 @@ class AutoAssignDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        # Inherit theme from main window
         if parent:
             self.setStyleSheet(parent.styleSheet())
 
@@ -116,7 +117,6 @@ class AutoAssignDialog(QDialog):
             cb.setChecked(checked)
 
     def selected_maps(self):
-        """Return dict of {map_type: path} for checked items."""
         return {
             mt: path for mt, path in self.candidates.items()
             if self.checkboxes[mt].isChecked()
@@ -225,7 +225,88 @@ class ImagePreviewWidget(QWidget):
 
 
 # -------------------------------------------------------------------
-# MainWindow (updated with auto‑assignment logic)
+# LogOverlay : transparent terminal‑log overlay (NEW)
+# -------------------------------------------------------------------
+class LogOverlay(QWidget):
+    """
+    A completely transparent widget that draws up to 10 recent log lines.
+    Each line fades out after 15 seconds.
+    After the 6th line a linear gradient fades the remaining text to transparent.
+    No frame, no background – just shadowed white text.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)   # clicks pass through
+        self.entries = []          # (message, perf_counter timestamp)
+        self.font = QFont("Consolas", 10)
+        self.line_height = QFontMetrics(self.font).height() + 2
+        self.max_visible_lines = 10
+
+        # Timer to repaint for smooth opacity animation
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update)
+        self.timer.start(50)       # ~20 fps
+
+    def add_log(self, message):
+        self.entries.append((message, time.perf_counter()))
+        # Keep the list from growing indefinitely
+        if len(self.entries) > 200:
+            self.entries = self.entries[-100:]
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        painter.setFont(self.font)
+
+        now = time.perf_counter()
+        # Remove entries older than 15 seconds (fully faded)
+        self.entries = [(msg, t) for msg, t in self.entries if now - t <= 15.0]
+        if not self.entries:
+            return
+
+        # Show newest lines at the top
+        recent = list(reversed(self.entries))[:self.max_visible_lines]
+
+        x = 10
+        y = 5 + self.fontMetrics().ascent()          # first line baseline
+
+        for i, (msg, t) in enumerate(recent):
+            age = now - t
+            alpha = max(0.0, 1.0 - age / 15.0)
+            if alpha < 0.01:
+                continue
+
+            # Shadow (dark, semi‑transparent)
+            shadow_color = QColor(0, 0, 0, int(alpha * 120))
+            painter.setPen(shadow_color)
+            painter.drawText(x + 1, y + 1, msg)
+
+            # Main text (white)
+            text_color = QColor(255, 255, 255, int(alpha * 255))
+            painter.setPen(text_color)
+            painter.drawText(x, y, msg)
+
+            y += self.line_height
+
+        # Gradient fade‑out after the 6th line
+        if len(recent) > 6:
+            start_y = 5 + 6 * self.line_height   # top of 7th line area
+            gradient = QLinearGradient(0, start_y, 0, self.height())
+            gradient.setColorAt(0.0, QColor(0, 0, 0, 255))   # opaque mask
+            gradient.setColorAt(1.0, QColor(0, 0, 0, 0))     # transparent mask
+
+            painter.save()
+            painter.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+            painter.fillRect(0, start_y, self.width(), self.height() - start_y, gradient)
+            painter.restore()
+
+
+# -------------------------------------------------------------------
+# MainWindow (updated with log overlay and log() helper)
 # -------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self, worker_class):
@@ -256,13 +337,12 @@ class MainWindow(QMainWindow):
             "Alpha": None,
         }
         self.out_dir = None
-        # Flag to prevent recursive auto‑assign while we programmatically set maps
         self._suppress_auto_assign = False
         self.init_ui()
         self.apply_theme()
 
     # ---------------------------------------------------------------
-    # UI setup (unchanged except for keeping the original structure)
+    # UI setup (added log overlay after the renderer)
     # ---------------------------------------------------------------
     def init_ui(self):
         main_widget = QWidget()
@@ -339,7 +419,6 @@ class MainWindow(QMainWindow):
         material_group.setLayout(material_layout)
         left_layout.addWidget(material_group)
 
-        # Select output directory
         out_group = QGroupBox("Directories")
         out_layout = QVBoxLayout()
         out_dir_layout = QHBoxLayout()
@@ -350,7 +429,6 @@ class MainWindow(QMainWindow):
         out_dir_layout.addWidget(self.btn_out)
         out_dir_layout.addWidget(self.lbl_out, 1)
 
-        # Select batch directory
         batch_dir_layout = QHBoxLayout()
         self.btn_batch = QPushButton("Select Batch Directory")
         self.btn_batch.clicked.connect(self.select_batch_directory)
@@ -360,18 +438,15 @@ class MainWindow(QMainWindow):
         batch_dir_layout.addWidget(self.lbl_batch, 1)
         out_layout.addLayout(batch_dir_layout)
 
-        # Open output folder when done
         out_layout.addLayout(out_dir_layout)
         options_layout = QHBoxLayout()
         self.chk_open = QCheckBox("Open folder when done")
         self.chk_open.setChecked(True)
-
         options_layout.addWidget(self.chk_open)
         out_layout.addLayout(options_layout)
         out_group.setLayout(out_layout)
         left_layout.addWidget(out_group)
 
-        # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
@@ -379,19 +454,16 @@ class MainWindow(QMainWindow):
         self.progress_bar.hide()
         left_layout.addWidget(self.progress_bar)
 
-        # Pack button
         self.btn_pack = QPushButton("Pack Textures")
         self.btn_pack.setMinimumHeight(40)
         self.btn_pack.clicked.connect(self.start_packing)
         left_layout.addWidget(self.btn_pack)
         left_layout.addStretch()
 
-        # Batch process
         self.btn_batch_process = QPushButton("Batch Process")
         self.btn_batch_process.setMinimumHeight(40)
         self.btn_batch_process.clicked.connect(self.process_batch)
         left_layout.addWidget(self.btn_batch_process)
-
 
         right_panel = QWidget()
         right_panel.setMouseTracking(True)
@@ -406,8 +478,18 @@ class MainWindow(QMainWindow):
         self.preview_mode_label.setAlignment(Qt.AlignCenter)
         self.preview_mode_label.setFixedHeight(20)
         right_layout.addWidget(self.preview_mode_label)
+
+        # Renderer widget
         self.pbr_renderer = PBRRendererWidget()
         right_layout.addWidget(self.pbr_renderer)
+
+        # --- Log overlay placed on top of the renderer (top‑left) ---
+        self.log_overlay = LogOverlay(self.pbr_renderer)
+        self.log_overlay.setFixedSize(420, 200)
+        self.log_overlay.move(10, 10)
+        self.log_overlay.show()
+        self.log("Ready.")    # initial message
+
         reset_btn = QPushButton("Reset View")
         reset_btn.clicked.connect(self.reset_view)
         right_layout.addWidget(reset_btn)
@@ -420,7 +502,14 @@ class MainWindow(QMainWindow):
         self.installEventFilters(self)
 
     # ---------------------------------------------------------------
-    # Batch Processing
+    # Log helper (new)
+    # ---------------------------------------------------------------
+    def log(self, message):
+        """Add a line to the transparent terminal overlay."""
+        self.log_overlay.add_log(message)
+
+    # ---------------------------------------------------------------
+    # Batch Processing (now logs its progress)
     # ---------------------------------------------------------------
     def select_batch_directory(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Select Batch Directory (containing texture sets)")
@@ -429,11 +518,9 @@ class MainWindow(QMainWindow):
             self.lbl_batch.setText(dir_path)
 
     def _find_texture_set_in_folder(self, folder_path, base_name):
-        """Return dict {map_type: file_path} for a given base name using MAP_SUFFIXES."""
         result = {}
         for map_type, suffixes in MAP_SUFFIXES.items():
             for suffix in suffixes:
-                # Try common extensions
                 for ext in ['.png', '.jpg', '.jpeg', '.tga', '.tif']:
                     candidate = os.path.join(folder_path, base_name + suffix + ext)
                     if os.path.isfile(candidate):
@@ -451,21 +538,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Output Directory", "Please select an output directory first.")
             return
 
-        # Disable UI during batch
         self.btn_batch_process.setEnabled(False)
         self.btn_pack.setEnabled(False)
         self.progress_bar.show()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Scanning batch folder...")
+        self.log("Batch processing started.")
 
-        # Gather all subdirectories (each is a texture set)
         subdirs = [d for d in os.listdir(self.batch_dir)
-                if os.path.isdir(os.path.join(self.batch_dir, d))]
+                   if os.path.isdir(os.path.join(self.batch_dir, d))]
         if not subdirs:
             QMessageBox.information(self, "No Sets", "No subdirectories found in batch folder.")
             self.btn_batch_process.setEnabled(True)
             self.btn_pack.setEnabled(True)
             self.progress_bar.hide()
+            self.log("No sets found.")
             return
 
         sets = []
@@ -473,18 +560,14 @@ class MainWindow(QMainWindow):
         for i, sub in enumerate(subdirs):
             self.progress_bar.setValue(int((i / total) * 50))
             self.progress_bar.setFormat(f"Scanning {sub}...")
+            self.log(f"Scanning {sub}...")
             QApplication.processEvents()
 
             folder_path = os.path.join(self.batch_dir, sub)
-            # Use the folder name as the base name (assuming textures are named like "folder_BaseColor.png")
-            # Alternatively, we could scan for any file and extract base name, but we'll keep it simple.
             base_name = sub
             maps = self._find_texture_set_in_folder(folder_path, base_name)
             if not maps:
-                # Fallback: try to find any file that matches suffixes regardless of base name
-                # But we need a common base; we'll pick the first file and strip suffix
                 all_files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
-                # Try to find a base name by checking each file against suffixes
                 found_base = None
                 for f in all_files:
                     name, ext = os.path.splitext(f)
@@ -500,53 +583,46 @@ class MainWindow(QMainWindow):
                 if found_base:
                     maps = self._find_texture_set_in_folder(folder_path, found_base)
                 else:
-                    # Still no maps? skip this folder
                     continue
 
-            # Check if we have at least BaseColor and some others? We'll accept any set.
-            # We'll store the set info
             sets.append({
                 'base_name': sub,
                 'maps': maps,
-                'output_subdir': sub  # use same name for output
+                'output_subdir': sub
             })
 
         if not sets:
-            QMessageBox.information(self, "No Texture Sets", "No valid texture sets found in batch folder.")
+            QMessageBox.information(self, "No Texture Sets", "No valid texture sets found.")
             self.btn_batch_process.setEnabled(True)
             self.btn_pack.setEnabled(True)
             self.progress_bar.hide()
+            self.log("No valid sets found.")
             return
 
-        # Now process each set sequentially (on main thread to use OpenGL renderer)
-        results = []  # list of (base_name, base_alpha, nms, output_path)
+        results = []
         for idx, set_info in enumerate(sets):
             self.progress_bar.setValue(50 + int((idx / len(sets)) * 40))
             self.progress_bar.setFormat(f"Composing {set_info['base_name']}...")
+            self.log(f"Composing {set_info['base_name']}...")
             QApplication.processEvents()
 
-            # Clear all input textures to avoid cross‑contamination
-            for map_name in ["BaseColor", "AO", "Metallic", "Smoothness", "Normal", "Alpha"]:
+            # Clear previous textures to avoid cross‑contamination
+            for map_name in self.paths:
+                self.paths[map_name] = None
                 self.pbr_renderer.load_input_texture(map_name, None)
-                self.paths = {key: None for key in self.paths}
-            
-            # Load textures into the renderer
+
             for map_type, path in set_info['maps'].items():
                 self.paths[map_type] = path
                 self.pbr_renderer.load_input_texture(map_type, path)
 
-            # Apply current AO intensity and normal parameters
             self.pbr_renderer.set_ao_intensity(self.ao_intensity)
             self.pbr_renderer.set_normal_generation(self.normal_gen_sigma, self.normal_gen_height)
             self.pbr_renderer.set_normal_y_inverted(self.invert_normal_y)
 
-            # Get composed arrays
             base_alpha, nms = self.pbr_renderer.get_composed_data()
             if base_alpha is None or nms is None:
-                # error, skip this set
                 continue
 
-            # Output path: out_dir / set_info['output_subdir']
             output_dir = os.path.join(self.out_dir, set_info['output_subdir'])
             results.append({
                 'base_name': set_info['base_name'],
@@ -555,9 +631,9 @@ class MainWindow(QMainWindow):
                 'output_dir': output_dir
             })
 
-        # Save all sets using BatchPackWorker
         self.progress_bar.setValue(90)
         self.progress_bar.setFormat("Saving textures...")
+        self.log("Saving packed textures...")
         QApplication.processEvents()
 
         self.batch_worker = BatchPackWorker(results)
@@ -568,26 +644,35 @@ class MainWindow(QMainWindow):
     def batch_finished(self, success, msg):
         self.btn_batch_process.setEnabled(True)
         self.btn_pack.setEnabled(True)
+
+        # --- Clear previous textures to avoid cross‑contamination after batch ---
+        for map_name in self.paths:
+            self.paths[map_name] = None
+            self.pbr_renderer.load_input_texture(map_name, None)
+
+        # Also clear the preview widgets so they reflect the empty state
+        for preview in self.previews.values():
+            preview.set_image(None)
+        # ---------------------------------------------------------------------
+
         if success:
             self.progress_bar.setValue(100)
             self.progress_bar.setFormat("Batch complete!")
+            self.log("Batch complete.")
             if self.chk_open.isChecked():
                 QDesktopServices.openUrl(QUrl.fromLocalFile(self.out_dir))
         else:
             self.progress_bar.setFormat(f"Batch error: {msg}")
+            self.log(f"Batch error: {msg}")
             QMessageBox.critical(self, "Batch Error", msg)
-        # Restore preview to last loaded set (optional)
-        # We could reload the last set from results, but we'll just leave as is.
+    
     # ---------------------------------------------------------------
-    # Texture management & auto‑assignment
+    # Texture management (unchanged except for a log on auto‑assign)
     # ---------------------------------------------------------------
     def update_texture(self, map_type, path):
-        """Called when a texture is dropped or selected manually."""
         self.paths[map_type] = path
         self.pbr_renderer.load_input_texture(map_type, path)
         self.preview_mode_label.setText("Previewing live input textures")
-
-        # Only trigger auto‑assignment if we are not already inside one
         if not self._suppress_auto_assign:
             self.attempt_auto_assign(map_type, path)
 
@@ -597,12 +682,6 @@ class MainWindow(QMainWindow):
         self.preview_mode_label.setText("Previewing live input textures")
 
     def attempt_auto_assign(self, dropped_map_type, dropped_path):
-        """
-        Extract base name from the dropped file, look for missing maps
-        in the same directory using known suffixes, and show a dialog
-        to let the user confirm which ones to assign.
-        """
-        # Nothing to do if all maps are already filled
         missing = [t for t in self.paths if t != dropped_map_type and self.paths[t] is None]
         if not missing:
             return
@@ -610,7 +689,6 @@ class MainWindow(QMainWindow):
         dir_path, filename = os.path.split(dropped_path)
         base, ext = os.path.splitext(filename)
 
-        # Find which suffix (if any) was used for the dropped map type
         stripped_base = base
         suffixes_for_type = sorted(
             MAP_SUFFIXES.get(dropped_map_type, []), key=len, reverse=True
@@ -620,7 +698,6 @@ class MainWindow(QMainWindow):
                 stripped_base = base[: -len(suffix)]
                 break
 
-        # Scan for candidate files for each missing map type
         candidates = {}
         for mtype in missing:
             for suffix in MAP_SUFFIXES.get(mtype, []):
@@ -628,12 +705,11 @@ class MainWindow(QMainWindow):
                 candidate_path = os.path.join(dir_path, candidate_name)
                 if os.path.isfile(candidate_path):
                     candidates[mtype] = candidate_path
-                    break  # first match wins
+                    break
 
         if not candidates:
             return
 
-        # Show dialog and apply selected maps if accepted
         dlg = AutoAssignDialog(stripped_base, candidates, parent=self)
         if dlg.exec_() == QDialog.Accepted:
             selected = dlg.selected_maps()
@@ -645,6 +721,7 @@ class MainWindow(QMainWindow):
                     self.pbr_renderer.load_input_texture(mtype, fpath)
                 self._suppress_auto_assign = False
                 self.preview_mode_label.setText("Previewing live input textures")
+                self.log(f"Auto‑assigned {len(selected)} map(s) for base '{stripped_base}'")
 
     # ---------------------------------------------------------------
     # Other UI handlers (unchanged)
@@ -802,6 +879,7 @@ class MainWindow(QMainWindow):
         base_alpha, nms = self.pbr_renderer.get_composed_data()
         self.btn_pack.setEnabled(False)
         self.progress_bar.show()
+        self.log("Packing started...")
 
         self.worker = self.worker_class(base_alpha, nms, self.out_dir)
         self.worker.progress.connect(self.update_progress)
@@ -816,9 +894,11 @@ class MainWindow(QMainWindow):
         self.btn_pack.setEnabled(True)
         if success:
             self.progress_bar.setFormat("100% - Finished!")
+            self.log("Packing finished successfully.")
             self.pbr_renderer.set_packed_textures(base_ao_data, nms_data)
             self.preview_mode_label.setText("Previewing packed output textures")
             if self.chk_open.isChecked():
                 QDesktopServices.openUrl(QUrl.fromLocalFile(self.out_dir))
         else:
             self.progress_bar.setFormat(f"Error: {msg}")
+            self.log(f"Packing error: {msg}")
