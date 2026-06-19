@@ -29,13 +29,18 @@ float getLuma(vec3 color) {
 }
 
 vec3 NormalFromLuma(vec2 uv) {
-    vec2 pix = 1.0 / textureSize(BaseColor, 0);
-    float sigma = max(u_normal_gen_sigma, 0.0001);
+    vec2 size = textureSize(BaseColor, 0);
+    float kernelK = size.x / 1024.0;
+    vec2 pix = 1.0 / size;
+
+    int kernelRadius = int(floor(kernelK)) * 3;
+
+    float sigma = max(u_normal_gen_sigma, 0.0001) * kernelK;
     float sigma_invSqr2 = 0.5 / (sigma * sigma);
     vec2 grad = vec2(0.0);
 
-    for(int xx = -3; xx <= 3; xx++) {
-        for(int yy = -3; yy <= 3; yy++) {
+    for(int xx = -kernelRadius; xx <= kernelRadius; xx++) {
+        for(int yy = -kernelRadius; yy <= kernelRadius; yy++) {
 
             vec2 offs = vec2(xx, yy);
             float sLenSqr = dot(offs, offs);
