@@ -14,6 +14,7 @@ from PyQt5.QtGui import (
     QRadialGradient,
 )
 from PyQt5.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -23,6 +24,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QSlider,
@@ -32,6 +34,7 @@ from PyQt5.QtWidgets import (
 )
 
 from pbr_renderer import PBRRendererWidget
+from pack_worker import BatchPackWorker
 
 # -------------------------------------------------------------------
 # Helper: common suffixes per map type (case‑insensitive matching)
