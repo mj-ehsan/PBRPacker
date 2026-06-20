@@ -1,0 +1,30 @@
+{
+    "map_types": ["BaseColor", "AO", "Metallic", "Smoothness", "Normal", "Alpha"],
+    "suffixes": {
+        "BaseColor": [
+            "_BaseColor", "_Albedo", "_Diffuse", "_Color", "_D", "_col",
+            "_basecolor", "_albedo", "_diffuse", "_color", "_diff"
+        ],
+        "AO": [
+            "_AO", "_AmbientOcclusion", "_Occlusion",
+            "_ao", "_ambientocclusion", "_occlusion"
+        ],
+        "Metallic": [
+            "_Metallic", "_Metalness", "_Metal",
+            "_metallic", "_metalness", "_metal"
+        ],
+        "Smoothness": [
+            "_Smoothness", "_Roughness", "_Smooth", "_Rough", "_rgh",
+            "_smoothness", "_roughness", "_smooth", "_rough"
+        ],
+        "Normal": [
+            "_Normal", "_NRM", "_N",
+            "_normal", "_nrm", "_n"
+        ],
+        "Alpha": [
+            "_Alpha", "_Opacity", "_Mask",
+            "_alpha", "_opacity", "_mask"
+        ]
+    },
+    "extensions": [".png", ".jpg", ".jpeg", ".tga", ".tif"]
+}

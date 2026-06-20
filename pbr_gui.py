@@ -1,4 +1,6 @@
-import os, time
+import json
+import os
+import time
 import numpy as np
 from PyQt5.QtCore import pyqtSignal, QRect, QRectF, Qt, QUrl, QTimer
 from PyQt5.QtGui import (QBrush, QColor, QDesktopServices, QFont, QFontMetrics,
@@ -6,24 +8,59 @@ from PyQt5.QtGui import (QBrush, QColor, QDesktopServices, QFont, QFontMetrics,
                           QRadialGradient, QLinearGradient)
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
                              QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
-                             QLabel, QMainWindow, QMessageBox, QProgressBar,
-                             QPushButton, QSlider, QSplitter, QVBoxLayout, QWidget)
+                             QLabel, QListWidget, QMainWindow, QMessageBox,
+                             QProgressBar, QPushButton, QSlider, QSplitter,
+                             QTabWidget, QVBoxLayout, QWidget)
 from pbr_renderer import PBRRendererWidget
 from pack_worker import BatchPackWorker
 
-MAP_SUFFIXES = {
-    "BaseColor": ["_BaseColor","_Albedo","_Diffuse","_Color","_D","_col",
-                  "_basecolor","_albedo","_diffuse","_color","_diff"],
-    "AO": ["_AO","_AmbientOcclusion","_Occlusion",
-           "_ao","_ambientocclusion","_occlusion"],
-    "Metallic": ["_Metallic","_Metalness","_Metal",
-                 "_metallic","_metalness","_metal"],
-    "Smoothness": ["_Smoothness","_Roughness","_Smooth","_Rough","_rgh",
-                   "_smoothness","_roughness","_smooth","_rough"],
-    "Normal": ["_Normal","_NRM","_N","_normal","_nrm","_n"],
-    "Alpha": ["_Alpha","_Opacity","_Mask","_alpha","_opacity","_mask"],
-}
+# -------------------------------------------------------------------
+# Load configuration files
+# -------------------------------------------------------------------
+def _load_json_config(filename):
+    """Load a JSON config file. Looks next to the script, then in CWD."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    paths = [os.path.join(script_dir, filename), os.path.join(os.getcwd(), filename)]
+    for p in paths:
+        if os.path.isfile(p):
+            with open(p, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    raise FileNotFoundError(f"Configuration file '{filename}' not found in {paths}")
 
+# Load texture aliases
+_aliases = _load_json_config("texture_aliases.json")
+MAP_TYPES = _aliases["map_types"]
+MAP_SUFFIXES = _aliases["suffixes"]
+VALID_EXTENSIONS = _aliases["extensions"]
+
+# Load theme
+_theme = _load_json_config("pbr_theme.json")
+
+def build_stylesheet():
+    """Convert theme JSON dict into a Qt stylesheet string."""
+    parts = []
+    for selector, props in _theme.items():
+        prop_str = "; ".join(f"{k}: {v}" for k, v in props.items())
+        parts.append(f"{selector} {{ {prop_str}; }}")
+    return "\n".join(parts)
+
+def find_texture_set_in_folder(folder, base):
+    """Given a folder and base name, return a dict of map_type -> filepath"""
+    result = {}
+    for mt, suffs in MAP_SUFFIXES.items():
+        for sf in suffs:
+            for ext in VALID_EXTENSIONS:
+                cand = os.path.join(folder, base + sf + ext)
+                if os.path.isfile(cand):
+                    result[mt] = cand
+                    break
+            if mt in result:
+                break
+    return result
+
+# -------------------------------------------------------------------
+# Auto‑assignment dialog (unchanged)
+# -------------------------------------------------------------------
 class AutoAssignDialog(QDialog):
     def __init__(self, base_name, candidates, parent=None):
         super().__init__(parent)
@@ -55,6 +92,9 @@ class AutoAssignDialog(QDialog):
     def selected_maps(self):
         return {mt: p for mt, p in self.candidates.items() if self.checkboxes[mt].isChecked()}
 
+# -------------------------------------------------------------------
+# ImagePreviewWidget (unchanged)
+# -------------------------------------------------------------------
 class ImagePreviewWidget(QWidget):
     fileDropped = pyqtSignal(str, str)
     cleared = pyqtSignal(str)
@@ -110,6 +150,9 @@ class ImagePreviewWidget(QWidget):
         painter.drawText(QRect(rect.x(), rect.height()-30, rect.width(), 30), Qt.AlignCenter, self.map_type)
         painter.end()
 
+# -------------------------------------------------------------------
+# LogOverlay (unchanged)
+# -------------------------------------------------------------------
 class LogOverlay(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -150,6 +193,9 @@ class LogOverlay(QWidget):
             painter.fillRect(0, start_y, self.width(), self.height()-start_y, gradient)
             painter.restore()
 
+# -------------------------------------------------------------------
+# MainWindow (with preview on the right, tabs on the left, batch preview)
+# -------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self, worker_class):
         super().__init__()
@@ -162,11 +208,12 @@ class MainWindow(QMainWindow):
         rgba = np.zeros((256,256,4),dtype=np.uint8); rgba[...,:3]=255; rgba[...,3]=noise//3
         self.noise_image = QImage(rgba.data,256,256,QImage.Format_ARGB32)
         self.noise_brush = QBrush(self.noise_image)
-        self.paths = {t:None for t in MAP_SUFFIXES}
+        self.paths = {t:None for t in MAP_TYPES}
         self.out_dir = None; self._suppress_auto_assign = False
+        self.batch_sets = []   # holds scanned sets
         self.setMouseTracking(True); self.init_ui(); self.apply_theme()
 
-    # ---------- UI helpers ----------
+    # ---------- helpers ----------
     def _make_slider(self, text, range_min, range_max, init, value_label, slot, layout):
         row = QHBoxLayout(); row.addWidget(QLabel(text))
         value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -176,161 +223,241 @@ class MainWindow(QMainWindow):
         layout.addWidget(slider)
         return slider
 
-    # ---------- UI creation ----------
-    def init_ui(self):
-        main = QWidget(self); self.setCentralWidget(main)
-        splitter = QSplitter(Qt.Horizontal)
+    def _make_output_group(self):
+        grp = QGroupBox("Output")
+        layout = QVBoxLayout()
+        od = QHBoxLayout()
+        btn_out = QPushButton("Select Output Directory")
+        btn_out.clicked.connect(self.select_output)
+        self.lbl_out = QLabel("No directory selected")
+        self.lbl_out.setWordWrap(True)
+        od.addWidget(btn_out); od.addWidget(self.lbl_out,1)
+        layout.addLayout(od)
+        self.chk_open = QCheckBox("Open folder when done")
+        self.chk_open.setChecked(True)
+        layout.addWidget(self.chk_open)
+        grp.setLayout(layout)
+        return grp
 
-        # left panel
-        left = QWidget(); left.setMouseTracking(True)
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(10,10,10,10); left_layout.setSpacing(10)
-        title = QLabel("Texture Maps"); title.setFont(QFont("Segoe UI",14,QFont.Bold)); title.setAlignment(Qt.AlignCenter)
-        left_layout.addWidget(title)
-
-        grid = QGridLayout(); grid.setSpacing(10)
-        self.previews = {}
-        for i, map_name in enumerate(MAP_SUFFIXES):
-            pv = ImagePreviewWidget(map_name)
-            pv.fileDropped.connect(self.update_texture); pv.cleared.connect(self.clear_texture)
-            self.previews[map_name] = pv
-            grid.addWidget(pv, i//3, i%3)
-        left_layout.addLayout(grid)
-
+    def _make_material_group(self):
+        grp = QGroupBox("Material Properties")
+        layout = QVBoxLayout()
+        self.ao_value_label = QLabel("1.00x")
+        self.ao_slider = self._make_slider("AO Intensity",0,200,100,self.ao_value_label,self.update_ao_intensity,layout)
+        self.normal_sigma_value_label = QLabel("1.00")
+        self.normal_sigma_slider = self._make_slider("Normal Sigma",1,500,100,self.normal_sigma_value_label,self.update_normal_generation,layout)
+        self.normal_height_value_label = QLabel("1.00")
+        self.normal_height_slider = self._make_slider("Normal Height",0,200,100,self.normal_height_value_label,self.update_normal_generation,layout)
         nt_layout = QHBoxLayout(); nt_layout.addStretch()
         self.chk_invert_normal_y = QCheckBox("Invert Y")
         self.chk_invert_normal_y.toggled.connect(self.update_normal_invert)
         nt_layout.addWidget(self.chk_invert_normal_y); nt_layout.addStretch()
-        left_layout.addLayout(nt_layout)
+        layout.addLayout(nt_layout)
+        grp.setLayout(layout)
+        return grp
 
-        # material group
-        mat_group = QGroupBox("Material Properties"); mat_layout = QVBoxLayout()
-        self.ao_value_label = QLabel("1.00x")
-        self.ao_slider = self._make_slider("AO Intensity",0,200,100,self.ao_value_label,self.update_ao_intensity,mat_layout)
-        self.normal_sigma_value_label = QLabel("1.00")
-        self.normal_sigma_slider = self._make_slider("Normal Sigma",1,500,100,self.normal_sigma_value_label,self.update_normal_generation,mat_layout)
-        self.normal_height_value_label = QLabel("1.00")
-        self.normal_height_slider = self._make_slider("Normal Height",0,200,100,self.normal_height_value_label,self.update_normal_generation,mat_layout)
-        mat_group.setLayout(mat_layout)
-        left_layout.addWidget(mat_group)
+    # ---------- UI creation ----------
+    def init_ui(self):
+        main = QWidget(self); self.setCentralWidget(main)
+        main_layout = QHBoxLayout(main)
+        splitter = QSplitter(Qt.Horizontal)
 
-        # directories group
-        out_group = QGroupBox("Directories"); out_layout = QVBoxLayout()
+        # --- LEFT SIDE: tabbed controls ---
+        self.tab_widget = QTabWidget()
+        # Tab 1: Single Process
+        single_tab = QWidget(); single_layout = QVBoxLayout(single_tab)
+        single_layout.setSpacing(10); single_layout.setContentsMargins(10,10,10,10)
+        # texture previews
+        grid = QGridLayout(); grid.setSpacing(10)
+        self.previews = {}
+        for i, map_name in enumerate(MAP_TYPES):
+            pv = ImagePreviewWidget(map_name)
+            pv.fileDropped.connect(self.update_texture); pv.cleared.connect(self.clear_texture)
+            self.previews[map_name] = pv
+            grid.addWidget(pv, i//3, i%3)
+        single_layout.addLayout(grid)
+        single_layout.addWidget(self._make_material_group())
+        single_layout.addWidget(self._make_output_group())
+        self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False)
+        single_layout.addWidget(self.progress_bar)
+        self.btn_pack = QPushButton("Pack Textures"); self.btn_pack.setMinimumHeight(40)
+        self.btn_pack.clicked.connect(self.start_packing)
+        single_layout.addWidget(self.btn_pack)
+        single_layout.addStretch()
+        self.tab_widget.addTab(single_tab, "Single Process")
+
+        # Tab 2: Batch Process
+        batch_tab = QWidget(); batch_layout = QVBoxLayout(batch_tab)
+        batch_layout.setSpacing(10); batch_layout.setContentsMargins(10,10,10,10)
+        # batch directory
+        bgrp = QGroupBox("Batch Directory"); bdl = QVBoxLayout()
         bd = QHBoxLayout()
         self.btn_batch = QPushButton("Select Batch Directory")
         self.btn_batch.clicked.connect(self.select_batch_directory)
-        self.lbl_batch = QLabel("No directory selected")
-        self.lbl_batch.setWordWrap(True)
-        bd.addWidget(self.btn_batch); bd.addWidget(self.lbl_batch,1); out_layout.addLayout(bd)
-        od = QHBoxLayout()
-        self.btn_out = QPushButton("Select Output Directory")
-        self.btn_out.clicked.connect(self.select_output)
-        self.lbl_out = QLabel("No directory selected")
-        self.lbl_out.setWordWrap(True)
-        od.addWidget(self.btn_out); od.addWidget(self.lbl_out,1); out_layout.addLayout(od)
-        opts = QHBoxLayout(); self.chk_open=QCheckBox("Open folder when done"); self.chk_open.setChecked(True)
-        opts.addWidget(self.chk_open); out_layout.addLayout(opts)
-        out_group.setLayout(out_layout)
-        left_layout.addWidget(out_group)
+        self.lbl_batch = QLabel("No directory selected"); self.lbl_batch.setWordWrap(True)
+        bd.addWidget(self.btn_batch); bd.addWidget(self.lbl_batch,1)
+        self.btn_scan = QPushButton("Scan")
+        self.btn_scan.clicked.connect(self._scan_batch_folder)
+        bd.addWidget(self.btn_scan)
+        bdl.addLayout(bd); bgrp.setLayout(bdl)
+        batch_layout.addWidget(bgrp)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        left_layout.addWidget(self.progress_bar)
+        # selected item preview
+        self.batch_preview_group = QGroupBox("Selected Item Preview")
+        preview_grid = QGridLayout(); preview_grid.setSpacing(10)
+        self.batch_previews = {}
+        for i, map_name in enumerate(MAP_TYPES):
+            pv = ImagePreviewWidget(map_name)
+            pv.setAcceptDrops(False); pv.setCursor(Qt.ArrowCursor)
+            self.batch_previews[map_name] = pv
+            preview_grid.addWidget(pv, i//3, i%3)
+        self.batch_preview_group.setLayout(preview_grid)
+        batch_layout.addWidget(self.batch_preview_group)
 
-        self.btn_pack = QPushButton("Pack Textures")
-        self.btn_pack.setMinimumHeight(40)
-        self.btn_pack.clicked.connect(self.start_packing)
-        left_layout.addWidget(self.btn_pack)
-        left_layout.addStretch()
-        self.btn_batch_process = QPushButton("Batch Process")
-        self.btn_batch_process.setMinimumHeight(40)
+        # batch items list
+        self.batch_items_group = QGroupBox("Batch Items")
+        items_layout = QVBoxLayout()
+        self.batch_list_widget = QListWidget()
+        self.batch_list_widget.currentRowChanged.connect(self._on_batch_item_selected)
+        items_layout.addWidget(self.batch_list_widget)
+        self.batch_items_group.setLayout(items_layout)
+        batch_layout.addWidget(self.batch_items_group)
+
+        batch_layout.addWidget(self._make_material_group())   # same material sliders (shared state)
+        batch_layout.addWidget(self._make_output_group())     # same output selection
+        self.batch_progress_bar = QProgressBar(); self.batch_progress_bar.setVisible(False)
+        batch_layout.addWidget(self.batch_progress_bar)
+        self.btn_batch_process = QPushButton("Batch Process"); self.btn_batch_process.setMinimumHeight(40)
         self.btn_batch_process.clicked.connect(self.process_batch)
-        left_layout.addWidget(self.btn_batch_process)
+        batch_layout.addWidget(self.btn_batch_process)
+        batch_layout.addStretch()
+        self.tab_widget.addTab(batch_tab, "Batch Process")
 
-        # right panel
-        right = QWidget(); right.setMouseTracking(True); right_layout = QVBoxLayout(right)
+        # --- RIGHT SIDE: 3D preview ---
+        right = QWidget(); right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(10,10,10,10)
-        pt = QLabel("3D PBR Preview"); pt.setFont(QFont("Segoe UI",14,QFont.Bold)); pt.setAlignment(Qt.AlignCenter); pt.setFixedHeight(20)
-        right_layout.addWidget(pt)
+        title = QLabel("3D PBR Preview"); title.setFont(QFont("Segoe UI",14,QFont.Bold)); title.setAlignment(Qt.AlignCenter)
+        title.setFixedHeight(20)
+        right_layout.addWidget(title)
         self.preview_mode_label = QLabel("Previewing live input textures")
-        self.preview_mode_label.setAlignment(Qt.AlignCenter)
-        self.preview_mode_label.setFixedHeight(20)
+        self.preview_mode_label.setAlignment(Qt.AlignCenter); self.preview_mode_label.setFixedHeight(20)
         right_layout.addWidget(self.preview_mode_label)
         self.pbr_renderer = PBRRendererWidget(); right_layout.addWidget(self.pbr_renderer)
-
         self.log_overlay = LogOverlay(self.pbr_renderer)
         self.log_overlay.setFixedSize(420,200); self.log_overlay.move(10,10); self.log_overlay.show()
-        self.log("Ready.")
-
         reset_btn = QPushButton("Reset View")
         reset_btn.clicked.connect(self.reset_view)
         right_layout.addWidget(reset_btn)
 
-        splitter.addWidget(left); splitter.addWidget(right); splitter.setSizes([500,900])
-        layout = QVBoxLayout(main); layout.addWidget(splitter)
+        splitter.addWidget(self.tab_widget)      # left side: controls
+        splitter.addWidget(right)               # right side: preview
+        splitter.setSizes([500, 900])           # give more space to preview
+        main_layout.addWidget(splitter)
+
+        # tab change to restore single preview when switching to Single Process
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
         for child in self.findChildren(QWidget):
             child.installEventFilter(self); child.setMouseTracking(True)
+
+    # ---------- tab change handling ----------
+    def _on_tab_changed(self, index):
+        if index == 0:  # Single Process tab
+            self._restore_single_preview()
+
+    def _restore_single_preview(self):
+        """Reload single-process paths into renderer and preview widgets."""
+        for map_type, path in self.paths.items():
+            self.pbr_renderer.load_input_texture(map_type, path)
+        self.preview_mode_label.setText("Previewing live input textures")
+
     # ---------- logging ----------
     def log(self, msg):
         self.log_overlay.add_log(msg)
 
-    # ---------- batch processing ----------
+    # ---------- batch scanning & preview ----------
     def select_batch_directory(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Select Batch Directory")
         if dir_path: self.batch_dir = dir_path; self.lbl_batch.setText(dir_path)
 
-    def _find_texture_set_in_folder(self, folder, base):
-        result = {}
-        for mt, suffs in MAP_SUFFIXES.items():
-            for sf in suffs:
-                for ext in ['.png','.jpg','.jpeg','.tga','.tif']:
-                    cand = os.path.join(folder, base+sf+ext)
-                    if os.path.isfile(cand): result[mt]=cand; break
-                if mt in result: break
-        return result
-
-    def process_batch(self):
-        if not self.batch_dir or not self.out_dir:
-            QMessageBox.warning(self, "Missing", "Select batch and output directories first."); return
-        self.btn_batch_process.setEnabled(False); self.btn_pack.setEnabled(False)
-        self.progress_bar.setVisible(True); self.progress_bar.setValue(0); self.progress_bar.setFormat("Scanning batch folder...")
-        self.log("Batch processing started.")
-
+    def _scan_batch_folder(self):
+        if not self.batch_dir:
+            QMessageBox.warning(self, "No Batch Directory", "Please select a batch directory first.")
+            return
+        self.log("Scanning batch folder...")
+        self.batch_list_widget.clear()
+        self.batch_sets = []
         subdirs = [d for d in os.listdir(self.batch_dir) if os.path.isdir(os.path.join(self.batch_dir,d))]
         if not subdirs:
+            self.log("No subdirectories found.")
             QMessageBox.information(self,"No Sets","No subdirectories found in batch folder.")
-            self.btn_batch_process.setEnabled(True); self.btn_pack.setEnabled(True); self.progress_bar.setVisible(False)
-            self.log("No sets found."); return
-
-        sets = []; total = len(subdirs)
-        for i, sub in enumerate(subdirs):
-            self.progress_bar.setValue(int(i/total*50)); self.progress_bar.setFormat(f"Scanning {sub}...")
-            self.log(f"Scanning {sub}..."); QApplication.processEvents()
+            return
+        for sub in subdirs:
             folder = os.path.join(self.batch_dir, sub)
-            maps = self._find_texture_set_in_folder(folder, sub)
+            maps = find_texture_set_in_folder(folder, sub)
             if not maps:
+                # try to guess base name
                 all_files = [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder,f))]
                 base = None
                 for f in all_files:
                     name, ext = os.path.splitext(f)
                     for suffs in MAP_SUFFIXES.values():
                         for sf in suffs:
-                            if name.lower().endswith(sf.lower()): base = name[:-len(sf)]; break
+                            if name.lower().endswith(sf.lower()):
+                                base = name[:-len(sf)]; break
                         if base: break
                     if base: break
-                if base: maps = self._find_texture_set_in_folder(folder, base)
-                else: continue
-            if maps: sets.append({'base_name':sub, 'maps':maps, 'output_subdir':sub})
-        if not sets:
+                if base: maps = find_texture_set_in_folder(folder, base)
+            if maps:
+                self.batch_sets.append({'base_name': sub, 'maps': maps, 'output_subdir': sub})
+                self.batch_list_widget.addItem(sub)
+        if not self.batch_sets:
+            self.log("No valid texture sets found.")
             QMessageBox.information(self,"No Texture Sets","No valid texture sets found.")
-            self.btn_batch_process.setEnabled(True); self.btn_pack.setEnabled(True); self.progress_bar.setVisible(False)
-            self.log("No valid sets found."); return
+        else:
+            self.log(f"Found {len(self.batch_sets)} set(s).")
+            # Select first item automatically to show preview
+            self.batch_list_widget.setCurrentRow(0)
+
+    def _on_batch_item_selected(self, row):
+        if row < 0 or row >= len(self.batch_sets):
+            # Clear preview
+            for pv in self.batch_previews.values():
+                pv.set_image(None)
+            return
+        set_info = self.batch_sets[row]
+        maps = set_info['maps']
+        for map_type in MAP_TYPES:
+            path = maps.get(map_type, None)
+            self.batch_previews[map_type].set_image(path)
+            self.pbr_renderer.load_input_texture(map_type, path)
+        self.preview_mode_label.setText(f"Previewing batch item: {set_info['base_name']}")
+
+    # ---------- batch processing ----------
+    def process_batch(self):
+        # If not scanned yet, scan automatically
+        if not self.batch_sets:
+            self._scan_batch_folder()
+        if not self.batch_sets:
+            QMessageBox.warning(self, "No Sets", "No valid texture sets found.")
+            return
+        if not self.out_dir:
+            QMessageBox.warning(self, "Missing", "Select an output directory first.")
+            return
+
+        self.btn_batch_process.setEnabled(False); self.btn_pack.setEnabled(False)
+        self.batch_progress_bar.setVisible(True); self.batch_progress_bar.setValue(0)
+        self.batch_progress_bar.setFormat("Composing textures...")
+        self.log("Batch processing started.")
 
         results = []
-        for idx, s in enumerate(sets):
-            self.progress_bar.setValue(50+int(idx/len(sets)*40)); self.progress_bar.setFormat(f"Composing {s['base_name']}...")
+        total = len(self.batch_sets)
+        for idx, s in enumerate(self.batch_sets):
+            self.batch_progress_bar.setValue(int((idx+1)/total*80))
+            self.batch_progress_bar.setFormat(f"Composing {s['base_name']}...")
             self.log(f"Composing {s['base_name']}..."); QApplication.processEvents()
+
+            # Load this set's textures into the renderer (temporary)
             for mn in self.paths: self.paths[mn]=None; self.pbr_renderer.load_input_texture(mn,None)
             for mt, p in s['maps'].items(): self.paths[mt]=p; self.pbr_renderer.load_input_texture(mt,p)
             self.pbr_renderer.set_ao_intensity(self.ao_intensity)
@@ -338,24 +465,29 @@ class MainWindow(QMainWindow):
             self.pbr_renderer.set_normal_y_inverted(self.invert_normal_y)
             ba, nms = self.pbr_renderer.get_composed_data()
             if ba is None or nms is None: continue
-            results.append({'base_name':s['base_name'], 'base_alpha':ba, 'nms':nms, 'output_dir':os.path.join(self.out_dir, s['output_subdir'])})
-        self.progress_bar.setValue(90); self.progress_bar.setFormat("Saving textures...")
+            results.append({'base_name':s['base_name'], 'base_alpha':ba, 'nms':nms,
+                            'output_dir':os.path.join(self.out_dir, s['output_subdir'])})
+
+        self.batch_progress_bar.setValue(90); self.batch_progress_bar.setFormat("Saving textures...")
         self.log("Saving packed textures..."); QApplication.processEvents()
         self.batch_worker = BatchPackWorker(results)
-        self.batch_worker.progress.connect(self.update_progress)
+        self.batch_worker.progress.connect(self.update_batch_progress)
         self.batch_worker.finished.connect(self.batch_finished)
         self.batch_worker.start()
+
+    def update_batch_progress(self, val, text):
+        self.batch_progress_bar.setValue(val); self.batch_progress_bar.setFormat(f"%p% - {text}")
 
     def batch_finished(self, success, msg):
         self.btn_batch_process.setEnabled(True); self.btn_pack.setEnabled(True)
         for mn in self.paths: self.paths[mn]=None; self.pbr_renderer.load_input_texture(mn,None)
         for pv in self.previews.values(): pv.set_image(None)
         if success:
-            self.progress_bar.setValue(100); self.progress_bar.setFormat("Batch complete!")
+            self.batch_progress_bar.setValue(100); self.batch_progress_bar.setFormat("Batch complete!")
             self.log("Batch complete.")
             if self.chk_open.isChecked(): QDesktopServices.openUrl(QUrl.fromLocalFile(self.out_dir))
         else:
-            self.progress_bar.setFormat(f"Batch error: {msg}"); self.log(f"Batch error: {msg}")
+            self.batch_progress_bar.setFormat(f"Batch error: {msg}"); self.log(f"Batch error: {msg}")
             QMessageBox.critical(self,"Batch Error",msg)
 
     # ---------- texture management ----------
@@ -412,7 +544,8 @@ class MainWindow(QMainWindow):
         if d: self.out_dir=d; self.lbl_out.setText(d)
 
     def start_packing(self):
-        if not self.out_dir: self.select_output(); return
+        if not self.out_dir:
+            QMessageBox.warning(self,"Missing","Please select an output directory first."); return
         ba, nms = self.pbr_renderer.get_composed_data()
         self.btn_pack.setEnabled(False); self.progress_bar.setVisible(True); self.log("Packing started...")
         self.worker = self.worker_class(ba, nms, self.out_dir)
@@ -453,18 +586,4 @@ class MainWindow(QMainWindow):
         painter.end()
 
     def apply_theme(self):
-        self.setStyleSheet("""
-            QWidget { color: #e0e0e0; font-family: "Segoe UI", sans-serif; }
-            QDialog { background-color: #1e1e22; }
-            QPushButton { background-color: #3a3a45; border: 1px solid #5a5a65; border-radius: 6px; padding: 8px 16px; font-weight: bold; }
-            QPushButton:hover { background-color: #4a4a55; border: 1px solid #7a7a85; }
-            QPushButton:pressed { background-color: #2a2a35; }
-            QProgressBar { background-color: #2a2a30; border: 1px solid #4a4a55; border-radius: 6px; text-align: center; }
-            QProgressBar::chunk { background-color: #4CAF50; border-radius: 5px; }
-            QCheckBox { spacing: 8px; } QCheckBox::indicator { width: 18px; height: 18px; background-color: #2a2a30; border: 1px solid #4a4a55; border-radius: 4px; }
-            QCheckBox::indicator:checked { background-color: #4CAF50; border: 1px solid #4CAF50; }
-            QSlider::groove:horizontal { height: 6px; background: #2a2a30; border-radius: 3px; }
-            QSlider::handle:horizontal { width: 16px; height: 16px; margin: -5px 0; background: #4CAF50; border-radius: 8px; }
-            QGroupBox { border: 1px solid #4a4a55; border-radius: 6px; margin-top: 10px; padding-top: 10px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
-        """)
+        self.setStyleSheet(build_stylesheet())

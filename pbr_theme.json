@@ -1,0 +1,91 @@
+{
+    "QWidget": {
+        "color": "#e0e0e0",
+        "font-family": "Segoe UI, sans-serif"
+    },
+    "QDialog": {
+        "background-color": "#1e1e22"
+    },
+    "QPushButton": {
+        "background-color": "#3a3a45",
+        "border": "1px solid #5a5a65",
+        "border-radius": "6px",
+        "padding": "8px 16px",
+        "font-weight": "bold"
+    },
+    "QPushButton:hover": {
+        "background-color": "#4a4a55",
+        "border": "1px solid #7a7a85"
+    },
+    "QPushButton:pressed": {
+        "background-color": "#2a2a35"
+    },
+    "QProgressBar": {
+        "background-color": "#2a2a30",
+        "border": "1px solid #4a4a55",
+        "border-radius": "6px",
+        "text-align": "center"
+    },
+    "QProgressBar::chunk": {
+        "background-color": "#4CAF50",
+        "border-radius": "5px"
+    },
+    "QCheckBox": {
+        "spacing": "8px"
+    },
+    "QCheckBox::indicator": {
+        "width": "18px",
+        "height": "18px",
+        "background-color": "#2a2a30",
+        "border": "1px solid #4a4a55",
+        "border-radius": "4px"
+    },
+    "QCheckBox::indicator:checked": {
+        "background-color": "#4CAF50",
+        "border": "1px solid #4CAF50"
+    },
+    "QSlider::groove:horizontal": {
+        "height": "6px",
+        "background": "#2a2a30",
+        "border-radius": "3px"
+    },
+    "QSlider::handle:horizontal": {
+        "width": "16px",
+        "height": "16px",
+        "margin": "-5px 0",
+        "background": "#4CAF50",
+        "border-radius": "8px"
+    },
+    "QGroupBox": {
+        "border": "1px solid #4a4a55",
+        "border-radius": "6px",
+        "margin-top": "10px",
+        "padding-top": "10px"
+    },
+    "QGroupBox::title": {
+        "subcontrol-origin": "margin",
+        "left": "10px",
+        "padding": "0 5px"
+    },
+    "QTabWidget::pane": {
+        "border": "1px solid #4a4a55",
+        "background": "#1e1e22"
+    },
+    "QTabBar::tab": {
+        "background": "#2a2a30",
+        "border": "1px solid #4a4a55",
+        "padding": "8px 16px",
+        "margin-right": "2px",
+        "border-top-left-radius": "8px",
+        "border-top-right-radius": "8px"
+    },
+    "QTabBar::tab:selected": {
+        "background": "#3a3a45",
+        "font-weight": "bold"
+    },
+    "QListWidget": {
+        "background-color": "#2a2a30",
+        "border": "1px solid #4a4a55",
+        "border-radius": "4px"
+    }
+}
