@@ -306,7 +306,7 @@ void main() {
         color += apply_lightPBR(lights[i], material, lightingData);
     }
     //apply ambient light
-    color += material.base * 0.02;
+    color += material.base * 0.02 * LightIndependentLightingData.oneMinusMetallic;
 
     if(!debug) {
         float exposure = 4.0;
