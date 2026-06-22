@@ -293,6 +293,8 @@ void applyDither(inout vec3 color, ivec2 pixelPos) {
 const bool debug = false;
 
 void main() {
+    vec3 ambientColor = vec3(0.03);
+    
     vec3 view_dir = normalize(camera_pos - v_world_pos);
 
     Material material;
@@ -306,7 +308,7 @@ void main() {
         color += apply_lightPBR(lights[i], material, lightingData);
     }
     //apply ambient light
-    color += material.base * 0.02 * LightIndependentLightingData.oneMinusMetallic;
+    color += material.base * ambientColor * lightingData.oneMinusMetallic;
 
     if(!debug) {
         float exposure = 4.0;

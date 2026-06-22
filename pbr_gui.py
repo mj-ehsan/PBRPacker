@@ -64,6 +64,7 @@ def find_texture_set_in_folder(folder, base):
 class AutoAssignDialog(QDialog):
     def __init__(self, base_name, candidates, parent=None):
         super().__init__(parent)
+        self.candidates = candidates
         self.setWindowTitle("Auto‑assign Texture Maps")
         self.setMinimumWidth(400)
         layout = QVBoxLayout(self)
@@ -265,50 +266,64 @@ class MainWindow(QMainWindow):
         # --- LEFT SIDE: tabbed controls ---
         self.tab_widget = QTabWidget()
         # Tab 1: Single Process
-        single_tab = QWidget(); single_layout = QVBoxLayout(single_tab)
-        single_layout.setSpacing(10); single_layout.setContentsMargins(10,10,10,10)
+        single_tab = QWidget()
+        single_layout = QVBoxLayout(single_tab)
+        single_layout.setSpacing(10)
+        single_layout.setContentsMargins(10,10,10,10)
         # texture previews
-        grid = QGridLayout(); grid.setSpacing(10)
+        grid = QGridLayout();
+        grid.setSpacing(10)
         self.previews = {}
         for i, map_name in enumerate(MAP_TYPES):
             pv = ImagePreviewWidget(map_name)
-            pv.fileDropped.connect(self.update_texture); pv.cleared.connect(self.clear_texture)
+            pv.fileDropped.connect(self.update_texture)
+            pv.cleared.connect(self.clear_texture)
             self.previews[map_name] = pv
             grid.addWidget(pv, i//3, i%3)
         single_layout.addLayout(grid)
         single_layout.addWidget(self._make_material_group())
         single_layout.addWidget(self._make_output_group())
-        self.progress_bar = QProgressBar(); self.progress_bar.setVisible(False)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
         single_layout.addWidget(self.progress_bar)
-        self.btn_pack = QPushButton("Pack Textures"); self.btn_pack.setMinimumHeight(40)
+        self.btn_pack = QPushButton("Pack Textures")
+        self.btn_pack.setMinimumHeight(40)
         self.btn_pack.clicked.connect(self.start_packing)
         single_layout.addWidget(self.btn_pack)
         single_layout.addStretch()
         self.tab_widget.addTab(single_tab, "Single Process")
 
         # Tab 2: Batch Process
-        batch_tab = QWidget(); batch_layout = QVBoxLayout(batch_tab)
-        batch_layout.setSpacing(10); batch_layout.setContentsMargins(10,10,10,10)
+        batch_tab = QWidget()
+        batch_layout = QVBoxLayout(batch_tab)
+        batch_layout.setSpacing(10)
+        batch_layout.setContentsMargins(10,10,10,10)
         # batch directory
-        bgrp = QGroupBox("Batch Directory"); bdl = QVBoxLayout()
+        bgrp = QGroupBox("Batch Directory")
+        bdl = QVBoxLayout()
         bd = QHBoxLayout()
         self.btn_batch = QPushButton("Select Batch Directory")
         self.btn_batch.clicked.connect(self.select_batch_directory)
-        self.lbl_batch = QLabel("No directory selected"); self.lbl_batch.setWordWrap(True)
-        bd.addWidget(self.btn_batch); bd.addWidget(self.lbl_batch,1)
+        self.lbl_batch = QLabel("No directory selected")
+        self.lbl_batch.setWordWrap(True)
+        bd.addWidget(self.btn_batch)
+        bd.addWidget(self.lbl_batch,1)
         self.btn_scan = QPushButton("Scan")
         self.btn_scan.clicked.connect(self._scan_batch_folder)
         bd.addWidget(self.btn_scan)
-        bdl.addLayout(bd); bgrp.setLayout(bdl)
+        bdl.addLayout(bd)
+        bgrp.setLayout(bdl)
         batch_layout.addWidget(bgrp)
 
         # selected item preview
         self.batch_preview_group = QGroupBox("Selected Item Preview")
-        preview_grid = QGridLayout(); preview_grid.setSpacing(10)
+        preview_grid = QGridLayout()
+        preview_grid.setSpacing(10)
         self.batch_previews = {}
         for i, map_name in enumerate(MAP_TYPES):
             pv = ImagePreviewWidget(map_name)
-            pv.setAcceptDrops(False); pv.setCursor(Qt.ArrowCursor)
+            pv.setAcceptDrops(False)
+            pv.setCursor(Qt.ArrowCursor)
             self.batch_previews[map_name] = pv
             preview_grid.addWidget(pv, i//3, i%3)
         self.batch_preview_group.setLayout(preview_grid)
