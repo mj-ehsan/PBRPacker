@@ -133,9 +133,9 @@ class PBRRendererWidget(QOpenGLWidget):
         glEnable(GL_MULTISAMPLE)
         glClearColor(0.12, 0.12, 0.13, 1.0)
         glEnable(GL_DEPTH_TEST)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        #glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE)
+        #glEnable(GL_BLEND)
+        #glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE)
 
         self.check_anisotropy_support()
         self.create_sphere_geometry()
