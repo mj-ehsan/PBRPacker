@@ -3,7 +3,7 @@
 
 #define MAX_LIGHTS 16
 
-#define PI 3.1415926535
+#define PI 3.141592653589793
 #define saturate(a) (clamp(a, 0.0, 1.0))
 #define rsqrt(a) inversesqrt(a)
 float max3component (vec3 v) { return max(max(v.x,v.y),v.z); }
@@ -13,7 +13,7 @@ uniform sampler2D nms_tex;
 uniform sampler2D u_environment_map;
 uniform bool u_use_environment_map;
 
-const float u_env_mip_count = 0.0; 
+uniform float u_env_mip_count; 
 
 uniform vec3 camera_pos;
 
@@ -220,7 +220,6 @@ vec3 ACESFitted(vec3 color)
     return clamp(color, 0.0, 1.0);
 }
 
-
 float ApplyNrmVarToRgh(vec3 nrm, vec3 nrm0, float rgh)
 {
     float d = dot(nrm, nrm0);
@@ -290,6 +289,44 @@ void applyDither(inout vec3 color, ivec2 pixelPos) {
     color += ditherValue / 255.0; // Scale to [0,1] range
 }
 
+vec3 sampleEquiangularHDR(sampler2D envMap, vec3 dir, float a)
+{
+    dir = normalize(dir);
+    float roughnessMip = a * u_env_mip_count;
+
+    float u = atan(dir.z, dir.x) / (2.0 * PI) + 0.5;
+    float v = asin(clamp(dir.y, -1.0, 1.0)) / PI + 0.5;
+    vec2 uv = vec2(u, v);
+
+    vec2 dx = dFdx(uv);
+    vec2 dy = dFdy(uv);
+
+    float maxGrad2 = max(dot(dx, dx), dot(dy, dy));
+    float gradientMip = 0.5 * log2(maxGrad2);
+
+    gradientMip += log2(float(textureSize(envMap, 0).x));
+
+    gradientMip = max(gradientMip, 0.0);
+
+    // --- Final mip level ---
+    float mipLevel = max(roughnessMip, gradientMip);
+
+
+    return textureLod(envMap, uv, a).rgb;
+}
+
+vec3 apply_reflectionMapPBR(sampler2D map, Material M, LightIndependentLightingData LD) {
+    vec3 F = Fresnel_Schlick(LD.noV, LD.f0);
+    float D = D_GGX(1.0f, M.roughness.z);
+	float G = G_SmithGGX_Correlated(LD, LD.noV, M.roughness.z);
+
+    vec3 specular = D * G * F * LD.quarterOverNoV;
+
+    vec3 rDir = reflect(LD.viewDir, M.normal);
+
+    return sampleEquiangularHDR(u_environment_map, rDir, M.roughness.y) * F;
+}
+
 const bool debug = false;
 
 void main() {
@@ -305,10 +342,10 @@ void main() {
 
     vec3 color = vec3(0.0, 0.0, 0.0);
     for(int i = (debug ? 2 : 0); i < (debug ? 3 : num_lights); i++) {
-        color += apply_lightPBR(lights[i], material, lightingData);
+       // color += apply_lightPBR(lights[i], material, lightingData);
     }
-    //apply ambient light
-    color += material.base * ambientColor * lightingData.oneMinusMetallic;
+    //color += material.base * ambientColor * lightingData.oneMinusMetallic;
+    color += apply_reflectionMapPBR(u_environment_map, material, lightingData) / 16.0;
 
     if(!debug) {
         float exposure = 4.0;

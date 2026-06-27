@@ -1,5 +1,6 @@
 import math
 import os
+import struct
 import numpy as np
 import glm
 from PIL import Image
@@ -9,6 +10,8 @@ from PyQt5.QtWidgets import QOpenGLWidget
 from PyQt5.QtGui import QSurfaceFormat
 from OpenGL.GL import *
 from OpenGL.GL.EXT.texture_filter_anisotropic import GL_TEXTURE_MAX_ANISOTROPY_EXT, GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT
+from OpenGL.GL.ARB.compute_shader import *
+from OpenGL.GL.ARB.shader_image_load_store import *
 
 # ----------------------------------------------------------------------
 # helper to convert numpy array to ctypes for VBO upload
@@ -17,7 +20,8 @@ def np_to_gl_array(arr, dtype=np.float32):
 # ----------------------------------------------------------------------
 # ----------------------------------------------------------------------
 # Path to the HDR environment map (equirectangular, e.g. .hdr or .exr)
-HDRI_PATH = os.path.join(os.path.dirname(__file__), "hdri", "small_empty_room_3_4k.exr")
+HDRI_PATH = os.path.join(os.path.dirname(__file__), "hdri", "small_empty_room_3_4k.hdr")
+HDR_MAP_DIR = os.path.join(os.path.dirname(__file__), "hdr_map")
 # ----------------------------------------------------------------------
 # helper to convert numpy array to ctypes for VBO upload
 def np_to_gl_array(arr, dtype=np.float32):
@@ -100,7 +104,11 @@ class PBRRendererWidget(QOpenGLWidget):
         self.needs_redraw = True
 
         self.hdri_texture = None
+        self.hdri_mipmapped_texture = None
+        self.hdri_mip_levels = 0
         self.hdri_loaded = False
+        self.mipgen_compute_shader = None
+        self.mipgen_completed = False
 
         self.readback_timer = QTimer()
         self.readback_timer.setSingleShot(True)
@@ -142,6 +150,7 @@ class PBRRendererWidget(QOpenGLWidget):
         self.create_wireframe_sphere_geometry()
         self.create_shader_programs()
         self.load_environment_map()
+        self.run_hdri_mipgen_pass()
         self.compose_requested = True
         self.timer.start(16)
 
@@ -163,8 +172,11 @@ class PBRRendererWidget(QOpenGLWidget):
             return
 
         try:
+            import cv2
             # imageio reads HDR files directly into a float32 numpy array (shape H,W,3/4)
-            img = imageio.imread(path)
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = np.ascontiguousarray(img.astype(np.float32))
         except Exception as e:
             print(f"Failed to read HDRI: {e}")
             self.hdri_loaded = False
@@ -211,6 +223,202 @@ class PBRRendererWidget(QOpenGLWidget):
         glBindTexture(GL_TEXTURE_2D, 0)
         return texture
     
+    # ------------------------------------------------------------------
+    # Compute-shader mip-map generation for HDRI
+    # ------------------------------------------------------------------
+    def run_hdri_mipgen_pass(self):
+        """Run once at startup: generate a full mip chain for the HDRI
+        environment map using a compute shader, store the result in a
+        separate texture, and save it to hdr_map/ as a KTX file."""
+        if self.mipgen_completed:
+            return
+        if not self.hdri_loaded or self.hdri_texture is None:
+            return
+        if self.mipgen_compute_shader is None:
+            return
+
+        os.makedirs(HDR_MAP_DIR, exist_ok=True)
+
+        hdri_basename = os.path.splitext(os.path.basename(HDRI_PATH))[0]
+        ktx_path = os.path.join(HDR_MAP_DIR, hdri_basename + "_mipmapped.ktx")
+
+        if self._try_load_ktx_cache(ktx_path):
+            print(f"[HDR mipgen] Loaded cached KTX from {ktx_path}")
+            self.mipgen_completed = True
+            return
+
+        print("[HDR mipgen] Generating mip chain via compute shader ...")
+
+        glBindTexture(GL_TEXTURE_2D, self.hdri_texture)
+        src_w = glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH)
+        src_h = glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+        mip_levels = 1 + int(math.floor(math.log2(max(src_w, src_h))))
+
+        mipmapped_tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, mipmapped_tex)
+        glTexStorage2D(GL_TEXTURE_2D, mip_levels, GL_RGBA16F, src_w, src_h)
+
+        if self.has_anisotropy:
+            try:
+                glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, self.max_anisotropy)
+            except Exception:
+                pass
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+        self._copy_hdri_to_mip0(self.hdri_texture, mipmapped_tex, src_w, src_h)
+
+        glUseProgram(self.mipgen_compute_shader)
+
+        current_w, current_h = src_w, src_h
+        for level in range(1, mip_levels):
+            dst_w = max(1, current_w // 2)
+            dst_h = max(1, current_h // 2)
+
+            glBindImageTexture(0, mipmapped_tex, level - 1, GL_FALSE, 0,
+                               GL_READ_ONLY, GL_RGBA16F)
+            glBindImageTexture(1, mipmapped_tex, level, GL_FALSE, 0,
+                               GL_WRITE_ONLY, GL_RGBA16F)
+
+            groups_x = (dst_w + 7) // 8
+            groups_y = (dst_h + 7) // 8
+            glDispatchCompute(groups_x, groups_y, 1)
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+
+            current_w, current_h = dst_w, dst_h
+
+        glUseProgram(0)
+
+        self.hdri_mipmapped_texture = mipmapped_tex
+        self.hdri_mip_levels = mip_levels
+        self.mipgen_completed = True
+
+        self._save_ktx(ktx_path, mipmapped_tex, src_w, src_h, mip_levels)
+
+        print(f"[HDR mipgen] Done — {mip_levels} mip levels, saved to {ktx_path}")
+
+    def _copy_hdri_to_mip0(self, src_tex, dst_tex, width, height):
+        """Copy the HDRI (RGB16F) into mip level 0 of the RGBA16F target."""
+        fbo = glGenFramebuffers(1)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo)
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, src_tex, 0)
+        glBindTexture(GL_TEXTURE_2D, dst_tex)
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
+        glDeleteFramebuffers(1, [fbo])
+
+    # ------------------------------------------------------------------
+    # KTX 1 file helpers (GL_RGBA16F, 2D texture with mip chain)
+    # ------------------------------------------------------------------
+    def _save_ktx(self, path, texture, base_w, base_h, mip_levels):
+        """Write a minimal KTX 1 file containing all mip levels of a
+        GL_RGBA16F 2D texture."""
+        KTX_IDENTIFIER = b'\xABKTX 11\xBB\r\n\x1A\n'
+        ENDIANNESS = 0x04030201
+
+        GL_HALF_FLOAT = 0x140B
+        GL_RGBA_ENUM = 0x1908
+        GL_RGBA16F_ENUM = 0x881A
+        GL_TEXTURE_2D_ENUM = 0x0DE1
+
+        glBindTexture(GL_TEXTURE_2D, texture)
+
+        with open(path, 'wb') as fp:
+            fp.write(KTX_IDENTIFIER)
+            fp.write(struct.pack('<I', ENDIANNESS))
+            fp.write(struct.pack('<I', GL_HALF_FLOAT))
+            fp.write(struct.pack('<I', 8))
+            fp.write(struct.pack('<I', GL_RGBA_ENUM))
+            fp.write(struct.pack('<I', GL_RGBA_ENUM))
+            fp.write(struct.pack('<I', GL_RGBA16F_ENUM))
+            fp.write(struct.pack('<I', base_w))
+            fp.write(struct.pack('<I', base_h))
+            fp.write(struct.pack('<I', 0))
+            fp.write(struct.pack('<I', 0))
+            fp.write(struct.pack('<I', 1))
+            fp.write(struct.pack('<I', mip_levels))
+            fp.write(struct.pack('<I', 0))
+
+            for level in range(mip_levels):
+                lw = max(1, base_w >> level)
+                lh = max(1, base_h >> level)
+                byte_size = lw * lh * 4 * 2
+                buf = np.empty(lw * lh * 4, dtype=np.float16)
+                glGetTexImage(GL_TEXTURE_2D, level, GL_RGBA, GL_HALF_FLOAT, buf)
+                fp.write(struct.pack('<I', byte_size))
+                fp.write(buf.tobytes())
+                padding = (4 - (byte_size % 4)) % 4
+                if padding:
+                    fp.write(b'\x00' * padding)
+
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+    def _try_load_ktx_cache(self, path):
+        """Try loading a cached KTX file. Returns True on success."""
+        if not os.path.exists(path):
+            return False
+        if os.path.getmtime(HDRI_PATH) > os.path.getmtime(path):
+            return False
+
+        try:
+            return self._load_ktx(path)
+        except Exception as exc:
+            print(f"[HDR mipgen] Failed to load KTX cache: {exc}")
+            return False
+
+    def _load_ktx(self, path):
+        """Load a KTX 1 file previously written by _save_ktx and upload
+        to a GL texture. Returns True on success."""
+        KTX_IDENTIFIER = b'\xABKTX 11\xBB\r\n\x1A\n'
+
+        with open(path, 'rb') as fp:
+            ident = fp.read(12)
+            if ident != KTX_IDENTIFIER:
+                return False
+            header = struct.unpack('<13I', fp.read(52))
+            base_w = header[7]
+            base_h = header[8]
+            mip_levels = header[11]
+
+            texture = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, texture)
+            glTexStorage2D(GL_TEXTURE_2D, mip_levels, GL_RGBA16F, base_w, base_h)
+
+            GL_HALF_FLOAT_CONST = 0x140B
+            for level in range(mip_levels):
+                lw = max(1, base_w >> level)
+                lh = max(1, base_h >> level)
+                byte_size = struct.unpack('<I', fp.read(4))[0]
+                data = fp.read(byte_size)
+                glTexSubImage2D(GL_TEXTURE_2D, level, 0, 0, lw, lh,
+                                GL_RGBA, GL_HALF_FLOAT_CONST, data)
+                padding = (4 - (byte_size % 4)) % 4
+                if padding:
+                    fp.read(padding)
+
+            if self.has_anisotropy:
+                try:
+                    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT,
+                                    self.max_anisotropy)
+                except Exception:
+                    pass
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glBindTexture(GL_TEXTURE_2D, 0)
+
+            self.hdri_mipmapped_texture = texture
+            self.hdri_mip_levels = mip_levels
+            return True
+
     # ---- shader loading -------------------------------------------------
     def load_shader_source(self, filename):
         shader_path = os.path.join(self.shader_dir, filename)
@@ -241,8 +449,24 @@ class PBRRendererWidget(QOpenGLWidget):
     def create_shader_programs(self):
         self.shader_program = self.create_shader_program("pbr_preview.vert", "pbr_preview.frag")
         self.compose_shader_program = self.create_shader_program("compose.vert", "compose.frag")
+        self.mipgen_compute_shader = self.create_compute_shader_program("hdri_mipgen.comp")
         # create a full-screen triangle VAO for the compose pass
         self.compose_vao = self.create_fullscreen_quad_vao()
+
+    def create_compute_shader_program(self, compute_name):
+        source = self.load_shader_source(compute_name)
+        shader = glCreateShader(GL_COMPUTE_SHADER)
+        glShaderSource(shader, source)
+        glCompileShader(shader)
+        if glGetShaderiv(shader, GL_COMPILE_STATUS) != GL_TRUE:
+            raise RuntimeError(glGetShaderInfoLog(shader).decode())
+        program = glCreateProgram()
+        glAttachShader(program, shader)
+        glLinkProgram(program)
+        if glGetProgramiv(program, GL_LINK_STATUS) != GL_TRUE:
+            raise RuntimeError(glGetProgramInfoLog(program).decode())
+        glDeleteShader(shader)
+        return program
 
     def create_fullscreen_quad_vao(self):
         """Create a VAO containing a large triangle covering the whole screen."""
@@ -838,7 +1062,9 @@ class PBRRendererWidget(QOpenGLWidget):
             glUniform1i(glGetUniformLocation(self.shader_program, "nms_tex"), 1)
             # Environment map (if loaded)
             glActiveTexture(GL_TEXTURE2)
-            if self.hdri_loaded and self.hdri_texture:
+            if self.mipgen_completed and self.hdri_mipmapped_texture:
+                glBindTexture(GL_TEXTURE_2D, self.hdri_mipmapped_texture)
+            elif self.hdri_loaded and self.hdri_texture:
                 glBindTexture(GL_TEXTURE_2D, self.hdri_texture)
             else:
                 # Bind a dummy 1x1 default texture to avoid sampling invalid data
@@ -846,7 +1072,9 @@ class PBRRendererWidget(QOpenGLWidget):
                 glBindTexture(GL_TEXTURE_2D, dummy)
             glUniform1i(glGetUniformLocation(self.shader_program, "u_environment_map"), 2)
             glUniform1i(glGetUniformLocation(self.shader_program, "u_use_environment_map"),
-                        1 if self.hdri_loaded else 0)
+                        1 if (self.hdri_loaded or self.mipgen_completed) else 0)
+            glUniform1f(glGetUniformLocation(self.shader_program, "u_env_mip_count"),
+                        float(self.hdri_mip_levels) if self.mipgen_completed else 0.0)
 
             glBindVertexArray(self.sphere_vao)
             glDrawElements(GL_TRIANGLES, self.sphere_index_count, GL_UNSIGNED_INT, None)
